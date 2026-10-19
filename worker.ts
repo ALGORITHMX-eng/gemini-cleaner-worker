@@ -631,7 +631,7 @@ async function callGemini(apiKey: string, messages: unknown[]): Promise<any> {
       messages,
       max_tokens: 65000,
       response_format: { type: "json_object" },
-      reasoning_effort: "minimal",
+      reasoning_effort: "low",
     }),
     signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
   });
