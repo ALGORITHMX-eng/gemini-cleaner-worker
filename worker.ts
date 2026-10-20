@@ -634,9 +634,9 @@ async function callGemini(apiKey: string, messages: unknown[]): Promise<any> {
     body: JSON.stringify({
       model: MODEL,
       messages,
-      max_tokens: USE === "openrouter" ? 16000 : 65000,
+            max_tokens: USE === "openrouter" ? 320000 : 650000,
       response_format: { type: "json_object" },
-      ...(USE === "openrouter" ? {} : { reasoning_effort: "low" }),
+            ...(USE === "openrouter" ? { reasoning: { enabled: false } } : { reasoning_effort: "low" }),
     }),
     signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
   });
