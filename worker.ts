@@ -72,6 +72,8 @@ function nextUtcMidnight(now = Date.now()): number {
 
 // in-memory pause per key (429 / daily cap)
 const pausedUntil = new Map<number, number>();
+const missCount = new Map<string, number>(); // job id -> times a good reply came back without it
+const MAX_MISSES = Number(Deno.env.get("MAX_MISSES") ?? 3);
 
 // live counters, shown in logs + /health
 const state = {
@@ -173,6 +175,10 @@ function stripHtmlArtifacts(text: string): string {
     .trim();
 }
 
+function decodeEntities(t: string | null | undefined): string {
+  return String(t ?? "").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'").replace(/&nbsp;/gi, " ").trim();
+}
 const VALID_WORKPLACE = new Set(["REMOTE", "HYBRID", "ONSITE"]);
 const VALID_EMPTYPE = new Set(["FULL_TIME", "PART_TIME", "CONTRACT", "TEMPORARY", "INTERNSHIP", "VOLUNTEER"]);
 
@@ -403,6 +409,30 @@ function buildUserMessage(jobs: any[]): string {
   }).join("\n\n-----\n\n");
 }
 
+function replyText(payload: any): string {
+  const content = payload?.choices?.[0]?.message?.content ?? "";
+  return String(content).replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+}
+
+// when the whole reply is not valid JSON, rescue every job whose own block still parses
+function salvageResults(text: string, ids: string[]): SectionResult[] {
+  const starts: { at: number }[] = [];
+  for (const id of ids) {
+    const esc = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const m = new RegExp(`\\{\\s*"id"\\s*:\\s*"${esc}"`).exec(text);
+    if (m) starts.push({ at: m.index });
+  }
+  starts.sort((a, b) => a.at - b.at);
+  const out: SectionResult[] = [];
+  for (let i = 0; i < starts.length; i++) {
+    const seg = text.slice(starts[i].at, i + 1 < starts.length ? starts[i + 1].at : text.length).replace(/[\s,]+$/, "");
+    for (const candidate of [seg, seg.replace(/\]\s*\}\s*$/, "").replace(/[\s,]+$/, "")]) {
+      try { out.push(JSON.parse(candidate)); break; } catch { /* try the next form */ }
+    }
+  }
+  return out;
+}
+
 function parseResults(payload: any): SectionResult[] {
   const content = payload?.choices?.[0]?.message?.content ?? "";
   const text = String(content).replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
@@ -472,6 +502,25 @@ async function claimBatch(): Promise<any[]> {
     await supabase.from("jobs_pending").update({ last_error: INFLIGHT }).in("id", jobs.map((j: any) => j.id));
   }
   return jobs;
+}
+
+// jobs the model failed to return cleanly: retry up to MAX_MISSES times, then park them as failed
+async function releaseOrGiveUp(ids: string[]) {
+  const retry: string[] = [];
+  const giveUp: string[] = [];
+  for (const id of ids) {
+    const n = (missCount.get(id) ?? 0) + 1;
+    missCount.set(id, n);
+    (n >= MAX_MISSES ? giveUp : retry).push(id);
+  }
+  if (giveUp.length) {
+    await supabase.from("jobs_pending")
+      .update({ status: "failed", last_error: `gave_up_after_${MAX_MISSES}_bad_replies` })
+      .in("id", giveUp);
+    for (const id of giveUp) missCount.delete(id);
+    console.warn(`[give-up] parked ${giveUp.length} job(s) as failed: ${giveUp.join(", ")}`);
+  }
+  await release(retry);
 }
 
 async function release(ids: string[]) {
@@ -573,7 +622,7 @@ async function writeOne(job: any, sections: Normalized): Promise<string> {
     job_url_normalized: job.job_url_normalized,
     dedup_hash: job.dedup_hash,
     company: job.company || "Unknown",
-    role: job.title,
+    role: decodeEntities(job.title),
     location: finalLocation,
     job_type: finalWorkplace,
     workplace_type: finalWorkplace,
@@ -720,8 +769,8 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
           console.error(`[${tag}] key ${keyIdx} rejected (${err.status}), paused 1h: ${err.body.slice(0, 120)}`);
         } else if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
           await dropCall(slotId); // model too slow, don't burn a daily slot
-          pausedUntil.set(keyIdx, Date.now() + 30_000);
-          console.warn(`[${tag}] timed out after ${GEMINI_TIMEOUT_MS / 1000}s, key ${keyIdx} backing off 30s`);
+          console.warn(`[${tag}] timed out after ${GEMINI_TIMEOUT_MS / 1000}s, this lane retries in 10s (other lanes keep going)`);
+          await sleep(10_000);
         } else if (err instanceof GeminiError && err.status === 413) {
           await dropCall(slotId);
           console.error(`[${tag}] ${err.body}`);
@@ -732,8 +781,9 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
           console.error(`[${tag}] HTTP ${err.status}, key ${keyIdx} paused 10min: ${err.body.slice(0, 250)}`);
         } else if (err instanceof GeminiError && [500, 502, 503, 504].includes(err.status)) {
           await dropCall(slotId); // provider overloaded, don't burn a daily slot
-          pausedUntil.set(keyIdx, Date.now() + 30_000);
-          console.warn(`[${tag}] ${err.status} overloaded, key ${keyIdx} backing off 30s`);
+          const wait = 15_000 + Math.floor(Math.random() * 30_000);
+          console.warn(`[${tag}] ${err.status} overloaded, this lane retries in ${Math.round(wait / 1000)}s`);
+          await sleep(wait);
         } else if (err instanceof GeminiError && err.status === 429) {
           await dropCall(slotId); // rate limited, don't burn a daily slot
           const daily = /per[\s-]*day|daily/i.test(err.body);
@@ -756,11 +806,18 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
       try {
         results = parseResults(payload);
       } catch (e) {
-        console.error(`[${tag}] bad json: ${String(e).slice(0, 200)} | ${JSON.stringify(payload).slice(0, 300)}`);
-        await release(ids);
-        await settleCall(slotId, 0, false);
-        state.batches_failed++;
-        continue;
+        const msg = String(e);
+        const pos = Number(/position (\d+)/.exec(msg)?.[1] ?? -1);
+        const text = replyText(payload);
+        console.error(`[${tag}] bad json: ${msg.slice(0, 160)} | near: ${pos >= 0 ? JSON.stringify(text.slice(Math.max(0, pos - 90), pos + 60)) : "?"}`);
+        results = salvageResults(text, ids);
+        console.warn(`[${tag}] salvaged ${results.length}/${ids.length} jobs from a broken reply`);
+        if (!results.length) {
+          await release(ids); // nothing usable: plain retry, no strike against the jobs
+          await settleCall(slotId, 0, false);
+          state.batches_failed++;
+          continue;
+        }
       }
 
       const byId = new Map(results.map((r) => [String(r.id || ""), r]));
@@ -779,7 +836,9 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
           missing.push(job.id);
         }
       }
-      await release(missing);
+      const missingSet = new Set(missing);
+      for (const j of jobs) if (!missingSet.has(j.id)) missCount.delete(j.id);
+      if (results.length) await releaseOrGiveUp(missing); else await release(missing);
       const tokens = (payload?.usage?.prompt_tokens || 0) + (payload?.usage?.completion_tokens || 0);
       await settleCall(slotId, tokens, true);
       state.batches_ok++;
