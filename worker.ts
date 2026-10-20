@@ -13,7 +13,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const USE = (Deno.env.get("LLM") ?? "gemini").toLowerCase(); // "gemini" or "openrouter"
 const MODEL = USE === "openrouter"
-    ? (Deno.env.get("OPENROUTER_MODEL") ?? "nvidia/nemotron-3-nano-30b-a3b:free")
+      ? (Deno.env.get("OPENROUTER_MODEL") ?? "nvidia/nemotron-3-super-120b-a12b:free")
   : (Deno.env.get("GEMINI_CLEAN_MODEL") ?? "gemini-3.8-flash");
 const PROVIDER = USE === "openrouter" ? "openrouter-clean" : "gemini-clean";
 const GEMINI_URL = USE === "openrouter"
