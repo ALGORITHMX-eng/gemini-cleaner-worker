@@ -11,10 +11,15 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const MODEL = Deno.env.get("GEMINI_CLEAN_MODEL") ?? "gemini-3.8-flash";
-const PROVIDER = "gemini-clean";
-const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
-const BATCH = 60;
+const USE = (Deno.env.get("LLM") ?? "gemini").toLowerCase(); // "gemini" or "openrouter"
+const MODEL = USE === "openrouter"
+    ? (Deno.env.get("OPENROUTER_MODEL") ?? "nvidia/nemotron-3-nano-30b-a3b:free")
+  : (Deno.env.get("GEMINI_CLEAN_MODEL") ?? "gemini-3.8-flash");
+const PROVIDER = USE === "openrouter" ? "openrouter-clean" : "gemini-clean";
+const GEMINI_URL = USE === "openrouter"
+  ? "https://openrouter.ai/api/v1/chat/completions"
+  : "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+const BATCH = Number(Deno.env.get("BATCH") ?? 60);
 const MIN_PENDING = Number(Deno.env.get("MIN_PENDING") ?? 20); // don't waste a call on tiny batches
 const DAILY_CAP = Number(Deno.env.get("DAILY_CAP") ?? 1500);   // requests per key per day
 const LANES_PER_KEY = Number(Deno.env.get("LANES_PER_KEY") ?? 10);
@@ -42,12 +47,12 @@ function loadKeys(): { idx: number; key: string }[] {
   const seen = new Set<string>();
   const out: { idx: number; key: string }[] = [];
   for (let i = 1; i <= 100; i++) {
-    const k = (Deno.env.get(`GEMINI_API_KEY_${i}`) ?? "").trim();
+    const k = (Deno.env.get(`${USE === "openrouter" ? "OPENROUTER_API_KEY" : "GEMINI_API_KEY"}_${i}`) ?? "").trim();
     if (!k || seen.has(k)) continue;
     seen.add(k);
     out.push({ idx: i, key: k });
   }
-  console.log(`[init] gemini keys: ${out.length}, lanes per key: ${LANES_PER_KEY}`);
+    console.log(`[init] provider=${USE} model=${MODEL || "(NOT SET)"} url=${GEMINI_URL} keys=${out.length} lanes_per_key=${LANES_PER_KEY} batch=${BATCH}`);
   return out;
 }
 const KEYS = loadKeys();
@@ -629,9 +634,9 @@ async function callGemini(apiKey: string, messages: unknown[]): Promise<any> {
     body: JSON.stringify({
       model: MODEL,
       messages,
-      max_tokens: 65000,
+      max_tokens: USE === "openrouter" ? 16000 : 65000,
       response_format: { type: "json_object" },
-      reasoning_effort: "low",
+      ...(USE === "openrouter" ? {} : { reasoning_effort: "low" }),
     }),
     signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
   });
@@ -671,7 +676,7 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         { role: "user", content: buildUserMessage(jobs) },
       ];
 
-      console.log(`[${tag}] claimed ${jobs.length} jobs -> calling Gemini (call ${used}/${DAILY_CAP})`);
+            console.log(`[${tag}] claimed ${jobs.length} jobs -> calling ${USE} (call ${used}/${DAILY_CAP})`);
       state.inflight++;
       const t0 = Date.now();
       let payload: any;
@@ -681,9 +686,17 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         state.inflight--;
         state.batches_failed++;
         await release(ids);
-        if (err instanceof GeminiError && err.status === 429) {
+        if (err instanceof GeminiError && (err.status === 401 || err.status === 403)) {
+          await dropCall(slotId);
+          pausedUntil.set(keyIdx, Date.now() + 60 * 60_000);
+          console.error(`[${tag}] key ${keyIdx} rejected (${err.status}), paused 1h: ${err.body.slice(0, 120)}`);
+        } else if (err instanceof GeminiError && [500, 502, 503, 504].includes(err.status)) {
+          await dropCall(slotId); // provider overloaded, don't burn a daily slot
+          pausedUntil.set(keyIdx, Date.now() + 30_000);
+          console.warn(`[${tag}] ${err.status} overloaded, key ${keyIdx} backing off 30s`);
+        } else if (err instanceof GeminiError && err.status === 429) {
           await dropCall(slotId); // rate limited, don't burn a daily slot
-          const daily = /per\s*day|daily/i.test(err.body);
+          const daily = /per[\s-]*day|daily/i.test(err.body);
           const until = daily ? nextUtcMidnight() : Date.now() + 60_000;
           pausedUntil.set(keyIdx, until);
           console.warn(`[${tag}] 429 from Gemini, key ${keyIdx} paused until ${new Date(until).toISOString()}`);
@@ -696,7 +709,7 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
       }
       state.inflight--;
       state.last_gemini_ms = Date.now() - t0;
-      console.log(`[${tag}] gemini ok in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+            console.log(`[${tag}] ${USE} ok in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
       // parse + write
       let results: SectionResult[] = [];
@@ -844,7 +857,8 @@ Deno.serve({ port: Number(Deno.env.get("PORT") ?? 8000) }, async (req) => {
   });
 });
 
-if (!KEYS.length) console.error("[init] NO GEMINI KEYS FOUND (GEMINI_API_KEY_1, _2, ...)");
+if (!KEYS.length) { console.error(`[init] NO KEYS FOUND for LLM=${USE}`); Deno.exit(1); }
+if (USE === "openrouter" && !MODEL) { console.error("[init] OPENROUTER_MODEL is not set"); Deno.exit(1); }
 for (const k of KEYS) {
   for (let l = 1; l <= LANES_PER_KEY; l++) {
     state.lanes_total++;
