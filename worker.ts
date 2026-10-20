@@ -11,20 +11,25 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const USE = (Deno.env.get("LLM") ?? "gemini").toLowerCase(); // "gemini" or "openrouter"
-const MODEL = USE === "openrouter"
-      ? (Deno.env.get("OPENROUTER_MODEL") ?? "nvidia/nemotron-3-super-120b-a12b:free")
+const USE = (Deno.env.get("LLM") ?? "gemini").toLowerCase(); // "gemini" | "openrouter" | "nvidia"
+const MODEL = USE === "nvidia"
+  ? (Deno.env.get("NVIDIA_MODEL") ?? "nvidia/nemotron-3.5-lightning-30b-a3b")
+  : USE === "openrouter"
+  ? (Deno.env.get("OPENROUTER_MODEL") ?? "nvidia/nemotron-3-super-120b-a12b:free")
   : (Deno.env.get("GEMINI_CLEAN_MODEL") ?? "gemini-3.8-flash");
-const PROVIDER = USE === "openrouter" ? "openrouter-clean" : "gemini-clean";
-const GEMINI_URL = USE === "openrouter"
+const PROVIDER = `${USE}-clean`; // gemini-clean | openrouter-clean | nvidia-clean
+const GEMINI_URL = USE === "nvidia"
+  ? "https://integrate.api.nvidia.com/v1/chat/completions"
+  : USE === "openrouter"
   ? "https://openrouter.ai/api/v1/chat/completions"
   : "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+const KEY_PREFIX = USE === "nvidia" ? "NVIDIA_API_KEY" : USE === "openrouter" ? "OPENROUTER_API_KEY" : "GEMINI_API_KEY";
 const BATCH = Number(Deno.env.get("BATCH") ?? 60);
 const MIN_PENDING = Number(Deno.env.get("MIN_PENDING") ?? 20); // don't waste a call on tiny batches
-const DAILY_CAP = Number(Deno.env.get("DAILY_CAP") ?? 1500);   // requests per key per day
+const DAILY_CAP = Number(Deno.env.get("DAILY_CAP") ?? (USE === "nvidia" ? 5000 : 1500));   // requests per key per day
 const LANES_PER_KEY = Number(Deno.env.get("LANES_PER_KEY") ?? 10);
 const IDLE_MS = 15_000;
-const GEMINI_TIMEOUT_MS = 300_000;
+const GEMINI_TIMEOUT_MS = Number(Deno.env.get("LLM_TIMEOUT_MS") ?? 120_000);
 const MAX_CHARS = 10000;
 const EXPIRES_DAYS = 90;
 const REQUIRE_REAL_LOCATION = true;
@@ -47,12 +52,15 @@ function loadKeys(): { idx: number; key: string }[] {
   const seen = new Set<string>();
   const out: { idx: number; key: string }[] = [];
   for (let i = 1; i <= 100; i++) {
-    const k = (Deno.env.get(`${USE === "openrouter" ? "OPENROUTER_API_KEY" : "GEMINI_API_KEY"}_${i}`) ?? "").trim();
+    const k = (Deno.env.get(`${KEY_PREFIX}_${i}`) ?? "").trim();
     if (!k || seen.has(k)) continue;
     seen.add(k);
     out.push({ idx: i, key: k });
   }
-    console.log(`[init] provider=${USE} model=${MODEL || "(NOT SET)"} url=${GEMINI_URL} keys=${out.length} lanes_per_key=${LANES_PER_KEY} batch=${BATCH}`);
+  // also accept a single plain NVIDIA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY
+  const plain = (Deno.env.get(KEY_PREFIX) ?? "").trim();
+  if (plain && !seen.has(plain)) out.unshift({ idx: 1, key: plain });
+  console.log(`[init] provider=${USE} model=${MODEL || "(NOT SET)"} url=${GEMINI_URL} keys=${out.length} lanes_per_key=${LANES_PER_KEY} batch=${BATCH} timeout=${GEMINI_TIMEOUT_MS / 1000}s`);
   return out;
 }
 const KEYS = loadKeys();
@@ -627,22 +635,42 @@ class GeminiError extends Error {
   }
 }
 
+const MAX_TOKENS = Number(Deno.env.get("MAX_TOKENS") ?? (USE === "gemini" ? 65000 : USE === "openrouter" ? 32000 : 16384));
+const NVIDIA_THINKING = Deno.env.get("NVIDIA_THINKING") === "1"; // set to 1 to let the model think first
+
+function buildBody(messages: unknown[]): Record<string, unknown> {
+  if (USE === "nvidia") {
+    return {
+      model: MODEL,
+      messages,
+      max_tokens: MAX_TOKENS,
+      temperature: 0.2,
+      // thinking off by default so the JSON answer fits and comes back fast
+      ...(NVIDIA_THINKING ? {} : { chat_template_kwargs: { enable_thinking: false } }),
+    };
+  }
+  if (USE === "openrouter") {
+    return { model: MODEL, messages, max_tokens: MAX_TOKENS, response_format: { type: "json_object" }, reasoning: { enabled: false } };
+  }
+  return { model: MODEL, messages, max_tokens: MAX_TOKENS, response_format: { type: "json_object" }, reasoning_effort: "low" };
+}
+
 async function callGemini(apiKey: string, messages: unknown[]): Promise<any> {
   const res = await fetch(GEMINI_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: MODEL,
-      messages,
-            max_tokens: USE === "openrouter" ? 162144  : 162144 ,
-      response_format: { type: "json_object" },
-            ...(USE === "openrouter" ? { reasoning: { enabled: false } } : { reasoning_effort: "low" }),
-    }),
+    body: JSON.stringify(buildBody(messages)),
     signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
   });
   const text = await res.text();
   if (!res.ok) throw new GeminiError(res.status, text.slice(0, 300));
-  return JSON.parse(text);
+  const json = JSON.parse(text);
+  // some providers answer HTTP 200 with an error body (e.g. upstream timeout)
+  if (json?.error) throw new GeminiError(Number(json.error.code) || 502, JSON.stringify(json.error).slice(0, 300));
+  if (json?.choices?.[0]?.finish_reason === "length") {
+    throw new GeminiError(413, "output hit max_tokens (finish_reason=length): lower BATCH or raise MAX_TOKENS");
+  }
+  return json;
 }
 
 // ---------------------------------------------------------------- one lane = one worker loop
@@ -676,7 +704,7 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         { role: "user", content: buildUserMessage(jobs) },
       ];
 
-            console.log(`[${tag}] claimed ${jobs.length} jobs -> calling ${USE} (call ${used}/${DAILY_CAP})`);
+      console.log(`[${tag}] claimed ${jobs.length} jobs -> calling ${USE} (call ${used}/${DAILY_CAP})`);
       state.inflight++;
       const t0 = Date.now();
       let payload: any;
@@ -690,6 +718,18 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
           await dropCall(slotId);
           pausedUntil.set(keyIdx, Date.now() + 60 * 60_000);
           console.error(`[${tag}] key ${keyIdx} rejected (${err.status}), paused 1h: ${err.body.slice(0, 120)}`);
+        } else if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+          await dropCall(slotId); // model too slow, don't burn a daily slot
+          pausedUntil.set(keyIdx, Date.now() + 30_000);
+          console.warn(`[${tag}] timed out after ${GEMINI_TIMEOUT_MS / 1000}s, key ${keyIdx} backing off 30s`);
+        } else if (err instanceof GeminiError && err.status === 413) {
+          await dropCall(slotId);
+          console.error(`[${tag}] ${err.body}`);
+          await sleep(5000);
+        } else if (err instanceof GeminiError && [400, 402, 404].includes(err.status)) {
+          await dropCall(slotId); // config/credit problem, retrying won't help
+          pausedUntil.set(keyIdx, Date.now() + 10 * 60_000);
+          console.error(`[${tag}] HTTP ${err.status}, key ${keyIdx} paused 10min: ${err.body.slice(0, 250)}`);
         } else if (err instanceof GeminiError && [500, 502, 503, 504].includes(err.status)) {
           await dropCall(slotId); // provider overloaded, don't burn a daily slot
           pausedUntil.set(keyIdx, Date.now() + 30_000);
@@ -709,7 +749,7 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
       }
       state.inflight--;
       state.last_gemini_ms = Date.now() - t0;
-            console.log(`[${tag}] ${USE} ok in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      console.log(`[${tag}] ${USE} ok in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
       // parse + write
       let results: SectionResult[] = [];
@@ -857,8 +897,7 @@ Deno.serve({ port: Number(Deno.env.get("PORT") ?? 8000) }, async (req) => {
   });
 });
 
-if (!KEYS.length) { console.error(`[init] NO KEYS FOUND for LLM=${USE}`); Deno.exit(1); }
-if (USE === "openrouter" && !MODEL) { console.error("[init] OPENROUTER_MODEL is not set"); Deno.exit(1); }
+if (!KEYS.length) { console.error(`[init] NO KEYS FOUND for LLM=${USE}: set ${KEY_PREFIX}_1`); Deno.exit(1); }
 for (const k of KEYS) {
   for (let l = 1; l <= LANES_PER_KEY; l++) {
     state.lanes_total++;
