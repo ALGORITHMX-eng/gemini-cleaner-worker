@@ -93,6 +93,7 @@ const state = {
   jobs_written: 0,
   jobs_dropped: 0,
   jobs_stale: 0,
+  loc_reasoned: 0,
   last_gemini_ms: 0,
   freshness_last_run: null as string | null,
 };
@@ -618,21 +619,31 @@ const MAX_TOKENS = Number(Deno.env.get("MAX_TOKENS") ?? (USE === "gemini" ? 6500
 // thinking is OFF and temperature is 0 on every provider
 const GEMINI_REASONING = Deno.env.get("GEMINI_REASONING_EFFORT") ?? "none"; // if Gemini answers HTTP 400 to "none", set this env to "minimal" or "low"
 
-function buildBody(messages: unknown[]): Record<string, unknown> {
+// Hybrid location reasoning. The bulk call always runs with thinking OFF.
+// A second, thinking-ON call is made only for the jobs whose location came back
+// unresolved — no country at all, an office name, or null. Cheap path for the
+// obvious ones, reasoning for the ones that need it.
+const LOCATION_REASONING = (Deno.env.get("LOCATION_REASONING") ?? "on").toLowerCase() !== "off";
+const LOCATION_REASON_TOKENS = Number(Deno.env.get("LOCATION_REASON_TOKENS") ?? 3000);
+const LOCATION_REASON_CHARS = Number(Deno.env.get("LOCATION_REASON_CHARS") ?? 6000);
+
+function buildBody(messages: unknown[], opts: { maxTokens?: number; thinking?: boolean } = {}): Record<string, unknown> {
+  const max_tokens = opts.maxTokens ?? MAX_TOKENS;
+  const think = opts.thinking === true;
   if (USE === "nvidia") {
-    return { model: MODEL, messages, max_tokens: MAX_TOKENS, temperature: 0, chat_template_kwargs: { enable_thinking: false } };
+    return { model: MODEL, messages, max_tokens, temperature: 0, chat_template_kwargs: { enable_thinking: think } };
   }
   if (USE === "openrouter") {
-    return { model: MODEL, messages, max_tokens: MAX_TOKENS, temperature: 0, response_format: { type: "json_object" }, reasoning: { enabled: false } };
+    return { model: MODEL, messages, max_tokens, temperature: 0, response_format: { type: "json_object" }, reasoning: { enabled: think } };
   }
-  return { model: MODEL, messages, max_tokens: MAX_TOKENS, temperature: 0, response_format: { type: "json_object" }, reasoning_effort: GEMINI_REASONING };
+  return { model: MODEL, messages, max_tokens, temperature: 0, response_format: { type: "json_object" }, reasoning_effort: think ? "low" : GEMINI_REASONING };
 }
 
-async function callGemini(apiKey: string, messages: unknown[]): Promise<any> {
+async function callGemini(apiKey: string, messages: unknown[], opts: { maxTokens?: number; thinking?: boolean } = {}): Promise<any> {
   const res = await fetch(GEMINI_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify(buildBody(messages)),
+    body: JSON.stringify(buildBody(messages, opts)),
     signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
   });
   const text = await res.text();
@@ -644,6 +655,70 @@ async function callGemini(apiKey: string, messages: unknown[]): Promise<any> {
     throw new GeminiError(413, "output hit max_tokens (finish_reason=length): lower BATCH or raise MAX_TOKENS");
   }
   return json;
+}
+
+// ---------------------------------------------------------------- hybrid location reasoning
+const COUNTRY_RE = /(United States|\bUSA\b|\bU\.S\.A?\.?\b|United Kingdom|\bU\.K\.?\b|England|Scotland|Wales|Ireland|Canada|India|Germany|Deutschland|France|Netherlands|Holland|Spain|Portugal|Poland|Italy|Sweden|Norway|Denmark|Finland|Switzerland|Austria|Belgium|Australia|New Zealand|Singapore|Japan|China|South Korea|Korea|Taiwan|Hong Kong|Malaysia|Indonesia|Philippines|Vietnam|Thailand|Brazil|Brasil|Mexico|Argentina|Colombia|Chile|Peru|Uruguay|Egypt|Nigeria|Kenya|Ghana|South Africa|Morocco|Tunisia|Israel|Turkey|United Arab Emirates|\bUAE\b|Saudi Arabia|Qatar|Pakistan|Bangladesh|Sri Lanka|Ukraine|Romania|Czech|Hungary|Greece|Bulgaria|Serbia|Croatia|Estonia|Latvia|Lithuania|Luxembourg|Iceland|Worldwide)/i;
+const OFFICE_WORD_RE = /\b(HQ|Headquarters|Head Office|Office|Campus|Site|Plant|Factory|Remote)\b/i;
+
+/** True when the answer still is not a usable "place, country". */
+function locationNeedsReasoning(loc: unknown): boolean {
+  const s = String(loc ?? "").trim();
+  if (!s) return true;
+  return s
+    .split("|")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .some((seg) => !COUNTRY_RE.test(seg) || (OFFICE_WORD_RE.test(seg) && seg.split(",").length < 2));
+}
+
+/**
+ * Second, thinking-ON call for one job's location only. Returns the new value,
+ * or undefined to keep what the bulk call said. A null return means "rejected":
+ * nothing in the posting points to a place, so the job gets dropped as before.
+ * Never throws — a failed resolve must not cost the job.
+ */
+async function reasonLocation(keyIdx: number, apiKey: string, job: any, current: any, content: string): Promise<string | null | undefined> {
+  const slotId = await reserveCall(keyIdx);
+  if (slotId == null) return undefined; // over cap: keep the bulk answer, don't spend
+  try {
+    const prompt = [
+      "Answer ONE question about this job posting: where is the candidate based?",
+      `Company: ${job.company ?? ""}`,
+      `Title: ${job.role ?? job.title ?? ""}`,
+      `Job URL: ${job.job_url ?? job.url ?? ""}`,
+      current ? `A fast pass answered: ${JSON.stringify(String(current))}` : "A fast pass found no place.",
+      "",
+      "Rules:",
+      '- Answer {"location": "<place>"} — "City, Country", or "City, State, Country" for the US.',
+      "- Resolve office names, company office labels and well-known cities/states to their country:",
+      '  "Bangalore HQ" -> "Bangalore, India"; "Dresden" -> "Dresden, Germany"; "Austin, TX" -> "Austin, TX, United States".',
+      "- Use the posting text, the company's offices and the job URL (Workday links often carry the place).",
+      '- Several places: join them with " | ", each resolved the same way.',
+      '- Nothing anywhere points to a place: answer {"location": null}.',
+      "- Never invent a place. Do not include the words remote, hybrid or onsite.",
+      "",
+      "POSTING:",
+      String(content || "").slice(0, LOCATION_REASON_CHARS),
+    ].join("\n");
+
+    const json = await callGemini(apiKey, [{ role: "user", content: prompt }], { maxTokens: LOCATION_REASON_TOKENS, thinking: true });
+    const tokens = (json?.usage?.prompt_tokens || 0) + (json?.usage?.completion_tokens || 0);
+    await settleCall(slotId, tokens, true);
+
+    const raw = String(replyText(json) ?? "").replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+    let parsed: any = null;
+    try { parsed = JSON.parse(raw); } catch { return undefined; }
+    if (!parsed || !("location" in parsed)) return undefined;
+    if (parsed.location === null) return null;
+    if (typeof parsed.location !== "string") return undefined;
+    const clean = parsed.location.replace(/\s+/g, " ").trim();
+    return clean || undefined;
+  } catch (e) {
+    await dropCall(slotId);
+    console.warn(`[loc-reason] ${job.id}: ${String(e).slice(0, 160)}`);
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------- one lane = one worker loop
@@ -754,6 +829,19 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         if (!raw) { missing.push(job.id); continue; }
         const sections = normalizeSections(raw);
         if (!isAcceptableResult(sections)) { missing.push(job.id); continue; }
+
+        // Hybrid reasoning: the bulk call runs with thinking off, so only the
+        // locations it could not finish get a second, thinking-on call.
+        if (LOCATION_REASONING && locationNeedsReasoning(sections.location)) {
+          const resolved = await reasonLocation(keyIdx, apiKey, job, sections.location, getJobContent(job));
+          if (resolved === null) {
+            sections.location = null; // nothing points to a place: writeOne drops it as usual
+            state.loc_reasoned++;
+          } else if (typeof resolved === "string") {
+            sections.location = resolved;
+            state.loc_reasoned++;
+          }
+        }
         try {
           const outcome = await writeOne(job, sections);
           if (outcome === "done") done++;
