@@ -93,6 +93,7 @@ const state = {
   jobs_written: 0,
   jobs_dropped: 0,
   jobs_stale: 0,
+  stale_precheck: 0,
   jobs_unresolved: 0,
   loc_reasoned: 0,
   loc_resolved: 0,
@@ -897,6 +898,63 @@ async function reasonLocationsBatch(
   return out;
 }
 
+// ---------------------------------------------------------------- posted date, read without a model
+// The board prints its own date ("Posted: 2026-05-01"). That is a deterministic
+// field: a regex reads it, and the model is never paid to discover that a posting
+// is six months old. Conservative on purpose — no label or no year means null,
+// and null means the model decides exactly as before.
+const POSTED_LABEL_RE = /\b(?:date\s+posted|posted(?:\s+on)?|published(?:\s+on)?|publication\s+date|date\s+published)\b\s*[:\-\u2013]?\s*([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})/i;
+const POSTED_REL_RE = /\bposted\s+(?:about\s+)?(\d+)\s+(day|week|month)s?\s+ago\b/i;
+
+/** The posting's own publish date in ms, or null when we are not certain. */
+function readPostedDate(content: string): number | null {
+  const head = String(content || "").slice(0, 2500);
+  const label = POSTED_LABEL_RE.exec(head);
+  if (label) {
+    const raw = label[1].replace(/(\d+)(st|nd|rd|th)\b/i, "$1");
+    const t = Date.parse(raw);
+    if (Number.isFinite(t)) {
+      if (t - Date.now() > 2 * DAY_MS) return null; // a "posted" date in the future is a parse accident
+      return t;
+    }
+  }
+  const rel = POSTED_REL_RE.exec(head);
+  if (rel) {
+    const n = Number(rel[1]);
+    const unit = rel[2].toLowerCase();
+    const ms = unit === "day" ? n * DAY_MS : unit === "week" ? n * 7 * DAY_MS : n * 30 * DAY_MS;
+    return Date.now() - ms;
+  }
+  return null;
+}
+
+/**
+ * Throw out postings that are already too old BEFORE a model call is spent on them.
+ * Distinct marker (stale_precheck) so a wrong regex can be requeued on its own
+ * without touching anything the model judged. Fails open: if the update errors,
+ * every job goes through as before.
+ */
+async function dropStaleEarly(tag: string, jobs: any[]): Promise<any[]> {
+  if (!jobs.length || MAX_AGE_DAYS <= 0) return jobs;
+  const keep: any[] = [];
+  const stale: string[] = [];
+  for (const job of jobs) {
+    const t = readPostedDate(getJobContent(job));
+    if (t != null && (Date.now() - t) / DAY_MS > MAX_AGE_DAYS) { stale.push(job.id); continue; }
+    keep.push(job);
+  }
+  if (!stale.length) return jobs;
+  const { error } = await supabase.from("jobs_pending")
+    .update({ status: "failed", last_error: "stale_precheck" }).in("id", stale);
+  if (error) {
+    console.error(`[${tag}] stale_precheck update failed, processing all: ${error.message}`);
+    return jobs;
+  }
+  state.stale_precheck += stale.length;
+  console.log(`[${tag}] stale_precheck: dropped ${stale.length}/${jobs.length} before calling the model`);
+  return keep;
+}
+
 // ---------------------------------------------------------------- one lane = one worker loop
 async function lane(keyIdx: number, laneNo: number, apiKey: string) {
   const tag = `k${keyIdx}-l${laneNo}`;
@@ -910,7 +968,14 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
 
       const claimed = await claimBatch();
       if (!claimed.length) { await sleep(IDLE_MS); continue; }
-      const { keep: jobs, extra } = fitBatch(claimed);
+
+      // Date first, model second: a posting the board itself dates as too old is
+      // dropped here, for free. Done before fitBatch so the release decision below
+      // is made on jobs that are actually worth a call.
+      const fresh = await dropStaleEarly(tag, claimed);
+      if (!fresh.length) { await sleep(500); continue; }
+
+      const { keep: jobs, extra } = fitBatch(fresh);
       if (extra.length) await release(extra.map((j: any) => j.id)); // did not fit this call, next call picks them up
 
       const slotId = await reserveCall(keyIdx);
@@ -1014,6 +1079,12 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         // does. Strip it before judging the answer, so "Remote - United States"
         // counts as "United States" instead of sending the job back to reasoning.
         sections.location = sections.location ? cleanLocationAnswer(sections.location) : sections.location;
+
+        // A date we read off the board beats the model's reading of the same date:
+        // the regex cannot invent a month, so it stops a fresh posting being killed
+        // as stale on a bad guess as well as making the stored posted_at exact.
+        const detDate = readPostedDate(getJobContent(job));
+        if (detDate != null) sections.posted_at = new Date(detDate).toISOString();
 
         const item: Staged = { job, sections, noLocationReason: "no_location" };
         staged.push(item);
@@ -1211,7 +1282,7 @@ setInterval(() => {
 // heartbeat so you always see it alive in the Render logs
 setInterval(async () => {
   const pending = await pendingCount();
-  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} no_location=${state.jobs_dropped} unresolved=${state.jobs_unresolved} stale=${state.jobs_stale} loc[asked=${state.loc_reasoned} resolved=${state.loc_resolved} none=${state.loc_none} unusable=${state.loc_unusable} unavailable=${state.loc_unavailable} cap=${state.loc_skipped_cap}] lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
+  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} no_location=${state.jobs_dropped} unresolved=${state.jobs_unresolved} stale=${state.jobs_stale} stale_pre=${state.stale_precheck} loc[asked=${state.loc_reasoned} resolved=${state.loc_resolved} none=${state.loc_none} unusable=${state.loc_unusable} unavailable=${state.loc_unavailable} cap=${state.loc_skipped_cap}] lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
 }, 30_000);
 
 console.log(`[init] worker up: ${state.lanes_total} lanes`);
