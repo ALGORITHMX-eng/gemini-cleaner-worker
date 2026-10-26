@@ -93,7 +93,13 @@ const state = {
   jobs_written: 0,
   jobs_dropped: 0,
   jobs_stale: 0,
+  jobs_unresolved: 0,
   loc_reasoned: 0,
+  loc_resolved: 0,
+  loc_none: 0,
+  loc_unavailable: 0,
+  loc_unusable: 0,
+  loc_skipped_cap: 0,
   last_gemini_ms: 0,
   freshness_last_run: null as string | null,
 };
@@ -464,7 +470,15 @@ async function claimBatch(): Promise<any[]> {
   if (error) throw new Error(error.message);
   const jobs = data ?? [];
   if (jobs.length) {
-    await supabase.from("jobs_pending").update({ last_error: INFLIGHT }).in("id", jobs.map((j: any) => j.id));
+    const ids = jobs.map((j: any) => j.id);
+    const { error: markErr } = await supabase.from("jobs_pending").update({ last_error: INFLIGHT }).in("id", ids);
+    if (markErr) {
+      // claim_jobs already set status=processing. Without the marker these rows are
+      // invisible to recoverStuck and would sit there forever, so put them straight
+      // back rather than leave a hole.
+      await release(ids);
+      throw new Error(`inflight mark failed: ${markErr.message}`);
+    }
   }
   return jobs;
 }
@@ -493,7 +507,11 @@ async function release(ids: string[]) {
   await supabase.from("jobs_pending").update({ status: "pending", last_error: null }).in("id", ids);
 }
 
-// on startup nothing is in flight (as long as Inngest is stopped), so free anything left stuck
+// On startup nothing is in flight (as long as Inngest is stopped), so free anything left stuck.
+// Two sweeps, because claim_jobs writes status=processing before the marker lands:
+//   (a) the normal case — the marker is there, free it whatever its age
+//   (b) the hole — processing with no marker at all, older than any real call can
+//       take (LLM_TIMEOUT_MS is 120s, so 15 minutes is never a live call)
 async function recoverStuck() {
   const { data, error } = await supabase
     .from("jobs_pending")
@@ -501,26 +519,39 @@ async function recoverStuck() {
     .eq("last_error", INFLIGHT)
     .select("id");
   if (error) console.error(`[recover] ${error.message}`);
-  else console.log(`[recover] released ${data?.length ?? 0} stuck jobs`);
+  else console.log(`[recover] released ${data?.length ?? 0} inflight jobs`);
+
+  const cutoff = new Date(Date.now() - 15 * 60_000).toISOString();
+  const { data: orphans, error: orphanErr } = await supabase
+    .from("jobs_pending")
+    .update({ status: "pending", last_error: null })
+    .eq("status", "processing")
+    .is("last_error", null)
+    .lt("updated_at", cutoff)
+    .select("id");
+  if (orphanErr) console.error(`[recover] orphan sweep: ${orphanErr.message}`);
+  else if (orphans?.length) console.warn(`[recover] released ${orphans.length} marker-less stuck jobs`);
 }
 
 // ---------------------------------------------------------------- write one job
 // Returns: "done" | "dropped" | "stale" | "deferred". Throws on a db error so the lane can count a strike.
-async function writeOne(job: any, sections: Normalized): Promise<string> {
+async function writeOne(job: any, sections: Normalized, noLocationReason = "no_location"): Promise<string> {
   const content = getJobContent(job);
   // the model's answers, stored exactly as given (null = the posting does not say)
   const { workplace_type: workplace, employment_type: employment, location } = sections;
   const postedAt = sections.posted_at ?? scrapedPostedIso(job.posted_at);
 
   // No location = the job is not shown to anyone, so it is not kept. The row
-  // stays in jobs_pending as status=failed / last_error=no_location, which means
-  // a posting can still be revived later with one UPDATE if a location source is
-  // ever added. Nothing else makes a job get thrown away except a stale date.
+  // stays in jobs_pending as status=failed, under one of two markers:
+  //   no_location     the posting really names no place — nothing to revive
+  //   loc_unresolved  we never learned where it is (cap, timeout, junk answer)
+  // The second is not a verdict, so it stays queryable and is safe to requeue
+  // once there is budget. Nothing else throws a job away except a stale date.
   if (!location) {
     const { error } = await supabase.from("jobs_pending")
-      .update({ status: "failed", last_error: "no_location" }).eq("id", job.id);
-    if (error) throw new Error(`no_location update failed: ${error.message}`);
-    return "dropped";
+      .update({ status: "failed", last_error: noLocationReason }).eq("id", job.id);
+    if (error) throw new Error(`${noLocationReason} update failed: ${error.message}`);
+    return noLocationReason === "no_location" ? "dropped" : "unresolved";
   }
 
   if (MAX_AGE_DAYS > 0 && postedAt) {
@@ -626,20 +657,25 @@ const GEMINI_REASONING = Deno.env.get("GEMINI_REASONING_EFFORT") ?? "none"; // i
 const LOCATION_REASONING = (Deno.env.get("LOCATION_REASONING") ?? "on").toLowerCase() !== "off";
 const LOCATION_REASON_TOKENS = Number(Deno.env.get("LOCATION_REASON_TOKENS") ?? 3000);
 const LOCATION_REASON_CHARS = Number(Deno.env.get("LOCATION_REASON_CHARS") ?? 6000);
+// The reasoning pass is only worth paying for if it is better at places than the
+// bulk model. Point it at a real reasoning model (same provider + key, different
+// model id). Empty = use MODEL, i.e. the old behaviour.
+const LOCATION_REASON_MODEL = (Deno.env.get("LOCATION_REASON_MODEL") ?? "").trim();
 
-function buildBody(messages: unknown[], opts: { maxTokens?: number; thinking?: boolean } = {}): Record<string, unknown> {
+function buildBody(messages: unknown[], opts: { maxTokens?: number; thinking?: boolean; model?: string } = {}): Record<string, unknown> {
   const max_tokens = opts.maxTokens ?? MAX_TOKENS;
   const think = opts.thinking === true;
+  const model = opts.model || MODEL;
   if (USE === "nvidia") {
-    return { model: MODEL, messages, max_tokens, temperature: 0, chat_template_kwargs: { enable_thinking: think } };
+    return { model, messages, max_tokens, temperature: 0, chat_template_kwargs: { enable_thinking: think } };
   }
   if (USE === "openrouter") {
-    return { model: MODEL, messages, max_tokens, temperature: 0, response_format: { type: "json_object" }, reasoning: { enabled: think } };
+    return { model, messages, max_tokens, temperature: 0, response_format: { type: "json_object" }, reasoning: { enabled: think } };
   }
-  return { model: MODEL, messages, max_tokens, temperature: 0, response_format: { type: "json_object" }, reasoning_effort: think ? "low" : GEMINI_REASONING };
+  return { model, messages, max_tokens, temperature: 0, response_format: { type: "json_object" }, reasoning_effort: think ? "low" : GEMINI_REASONING };
 }
 
-async function callGemini(apiKey: string, messages: unknown[], opts: { maxTokens?: number; thinking?: boolean } = {}): Promise<any> {
+async function callGemini(apiKey: string, messages: unknown[], opts: { maxTokens?: number; thinking?: boolean; model?: string } = {}): Promise<any> {
   const res = await fetch(GEMINI_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
@@ -660,10 +696,48 @@ async function callGemini(apiKey: string, messages: unknown[], opts: { maxTokens
 // ---------------------------------------------------------------- hybrid location reasoning
 const COUNTRY_RE = /(United States|\bUSA\b|\bU\.S\.A?\.?\b|United Kingdom|\bU\.K\.?\b|England|Scotland|Wales|Ireland|Canada|India|Germany|Deutschland|France|Netherlands|Holland|Spain|Portugal|Poland|Italy|Sweden|Norway|Denmark|Finland|Switzerland|Austria|Belgium|Australia|New Zealand|Singapore|Japan|China|South Korea|Korea|Taiwan|Hong Kong|Malaysia|Indonesia|Philippines|Vietnam|Thailand|Brazil|Brasil|Mexico|Argentina|Colombia|Chile|Peru|Uruguay|Egypt|Nigeria|Kenya|Ghana|South Africa|Morocco|Tunisia|Israel|Turkey|United Arab Emirates|\bUAE\b|Saudi Arabia|Qatar|Pakistan|Bangladesh|Sri Lanka|Ukraine|Romania|Czech|Hungary|Greece|Bulgaria|Serbia|Croatia|Estonia|Latvia|Lithuania|Luxembourg|Iceland|Worldwide)/i;
 const OFFICE_WORD_RE = /\b(HQ|Headquarters|Head Office|Office|Campus|Site|Plant|Factory|Remote)\b/i;
+const ARRANGEMENT_RE = /\b(fully\s+remote|remote|hybrid|on-?site)\b/gi;
+
+/**
+ * Strip the words "Remote" / "Hybrid" / "On-site" out of a place. The model is
+ * told not to write them, but it does ("Remote - United States", "... Area Hybrid").
+ * What is left is the place itself: "United States", "California - San Francisco Bay Area".
+ */
+function cleanLocationAnswer(value: unknown): string {
+  return String(value ?? "")
+    .split("|")
+    .map((seg) =>
+      seg
+        .replace(ARRANGEMENT_RE, " ")
+        .replace(/^\s*[-,;:]+\s*/, "")
+        .replace(/\s*[-,;:]+\s*$/, "")
+        .replace(/\s{2,}/g, " ")
+        .trim()
+    )
+    .filter(Boolean)
+    .join(" | ");
+}
+
+/**
+ * Is this a place the product can actually show? Not a gazetteer and not a
+ * country resolver (geo.ts owns that) — only a shape gate: every segment has to
+ * name a country or be Worldwide, and a bare office label does not count.
+ * "Belgium" passes. "Bangalore HQ" and "Nyeri" do not.
+ */
+function isUsableLocation(value: unknown): boolean {
+  const segs = cleanLocationAnswer(value).split("|").map((s) => s.trim()).filter(Boolean);
+  if (!segs.length) return false;
+  return segs.every((seg) => {
+    if (seg.toLowerCase() === GLOBAL_LABEL.toLowerCase()) return true;
+    if (!COUNTRY_RE.test(seg)) return false;
+    if (OFFICE_WORD_RE.test(seg) && seg.split(",").length < 2) return false;
+    return true;
+  });
+}
 
 /** True when the answer still is not a usable "place, country". */
 function locationNeedsReasoning(loc: unknown): boolean {
-  const s = String(loc ?? "").trim();
+  const s = cleanLocationAnswer(loc).trim();
   if (!s) return true;
   return s
     .split("|")
@@ -673,14 +747,30 @@ function locationNeedsReasoning(loc: unknown): boolean {
 }
 
 /**
- * Second, thinking-ON call for one job's location only. Returns the new value,
- * or undefined to keep what the bulk call said. A null return means "rejected":
- * nothing in the posting points to a place, so the job gets dropped as before.
- * Never throws — a failed resolve must not cost the job.
+ * What the second call concluded. These three are NOT interchangeable:
+ *  - resolved    the answer, ready to store
+ *  - none        the posting genuinely names no place  -> a truthful drop
+ *  - unusable    we did look, and the model still gave something we cannot show
+ *  - unavailable we never got an answer at all (cap, timeout, bad JSON, HTTP)
+ * Only `none` means "no_location". The other two mean "we do not know yet", and
+ * the job must not be parked as if the posting had no location.
  */
-async function reasonLocation(keyIdx: number, apiKey: string, job: any, current: any, content: string): Promise<string | null | undefined> {
+type LocVerdict =
+  | { kind: "resolved"; location: string }
+  | { kind: "none" }
+  | { kind: "unusable"; answer: string }
+  | { kind: "unavailable"; why: string };
+
+/**
+ * Second, thinking-ON call for one job's location only. Never throws — a failed
+ * resolve must not cost the job, it just must not be mistaken for a verdict either.
+ */
+async function reasonLocation(keyIdx: number, apiKey: string, job: any, current: any, content: string): Promise<LocVerdict> {
   const slotId = await reserveCall(keyIdx);
-  if (slotId == null) return undefined; // over cap: keep the bulk answer, don't spend
+  if (slotId == null) {
+    state.loc_skipped_cap++; // over cap: keep the bulk answer, don't spend
+    return { kind: "unavailable", why: "cap" };
+  }
   try {
     const prompt = [
       "Answer ONE question about this job posting: where is the candidate based?",
@@ -693,31 +783,40 @@ async function reasonLocation(keyIdx: number, apiKey: string, job: any, current:
       '- Answer {"location": "<place>"} — "City, Country", or "City, State, Country" for the US.',
       "- Resolve office names, company office labels and well-known cities/states to their country:",
       '  "Bangalore HQ" -> "Bangalore, India"; "Dresden" -> "Dresden, Germany"; "Austin, TX" -> "Austin, TX, United States".',
+      '- A country on its own is a complete answer: "Location: Belgium" -> "Belgium". Never add a city it does not name.',
+      '- "Remote - United States" -> "United States". A remote job that names a country still has that country.',
+      '- A city district or campus is that city: "Nantes" -> "Nantes, France".',
       "- Use the posting text, the company's offices and the job URL (Workday links often carry the place).",
       '- Several places: join them with " | ", each resolved the same way.',
-      '- Nothing anywhere points to a place: answer {"location": null}.',
+      '- Nothing anywhere points to a place: answer {"location": null}. "Remote" with no country anywhere is null.',
       "- Never invent a place. Do not include the words remote, hybrid or onsite.",
       "",
       "POSTING:",
       String(content || "").slice(0, LOCATION_REASON_CHARS),
     ].join("\n");
 
-    const json = await callGemini(apiKey, [{ role: "user", content: prompt }], { maxTokens: LOCATION_REASON_TOKENS, thinking: true });
+    const json = await callGemini(apiKey, [{ role: "user", content: prompt }], {
+      maxTokens: LOCATION_REASON_TOKENS,
+      thinking: true,
+      model: LOCATION_REASON_MODEL || undefined,
+    });
     const tokens = (json?.usage?.prompt_tokens || 0) + (json?.usage?.completion_tokens || 0);
     await settleCall(slotId, tokens, true);
 
     const raw = String(replyText(json) ?? "").replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
     let parsed: any = null;
-    try { parsed = JSON.parse(raw); } catch { return undefined; }
-    if (!parsed || !("location" in parsed)) return undefined;
-    if (parsed.location === null) return null;
-    if (typeof parsed.location !== "string") return undefined;
-    const clean = parsed.location.replace(/\s+/g, " ").trim();
-    return clean || undefined;
+    try { parsed = JSON.parse(raw); } catch { return { kind: "unavailable", why: "bad_json" }; }
+    if (!parsed || !("location" in parsed)) return { kind: "unavailable", why: "no_answer" };
+    if (parsed.location === null) return { kind: "none" };
+    if (typeof parsed.location !== "string") return { kind: "unavailable", why: "not_a_string" };
+    const clean = cleanLocationAnswer(parsed.location);
+    if (!clean) return { kind: "none" };
+    if (!isUsableLocation(clean)) return { kind: "unusable", answer: clean };
+    return { kind: "resolved", location: clean };
   } catch (e) {
     await dropCall(slotId);
     console.warn(`[loc-reason] ${job.id}: ${String(e).slice(0, 160)}`);
-    return undefined;
+    return { kind: "unavailable", why: String(e).slice(0, 80) };
   }
 }
 
@@ -822,7 +921,7 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
       }
 
       const byId = new Map(results.map((r) => [String(r.id || ""), r]));
-      let done = 0, dropped = 0, stale = 0;
+      let done = 0, dropped = 0, stale = 0, unresolved = 0;
       const missing: string[] = [];
       for (const job of jobs) {
         const raw = byId.get(String(job.id));
@@ -830,23 +929,40 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         const sections = normalizeSections(raw);
         if (!isAcceptableResult(sections)) { missing.push(job.id); continue; }
 
+        // The model is told not to write "Remote"/"Hybrid" inside a place, but it
+        // does. Strip it before judging the answer, so "Remote - United States"
+        // counts as "United States" instead of sending the job back to reasoning.
+        sections.location = sections.location ? cleanLocationAnswer(sections.location) : sections.location;
+
         // Hybrid reasoning: the bulk call runs with thinking off, so only the
         // locations it could not finish get a second, thinking-on call.
+        let noLocationReason = "no_location";
         if (LOCATION_REASONING && locationNeedsReasoning(sections.location)) {
-          const resolved = await reasonLocation(keyIdx, apiKey, job, sections.location, getJobContent(job));
-          if (resolved === null) {
-            sections.location = null; // nothing points to a place: writeOne drops it as usual
-            state.loc_reasoned++;
-          } else if (typeof resolved === "string") {
-            sections.location = resolved;
-            state.loc_reasoned++;
+          const verdict = await reasonLocation(keyIdx, apiKey, job, sections.location, getJobContent(job));
+          state.loc_reasoned++;
+          const bulk = sections.location;
+          if (verdict.kind === "resolved") {
+            sections.location = verdict.location;
+            state.loc_resolved++;
+          } else if (verdict.kind === "none") {
+            // the posting itself names no place: a truthful drop
+            sections.location = null;
+            state.loc_none++;
+          } else {
+            // we looked and never got a usable answer. Keep whatever the bulk pass
+            // said; if it said nothing, this job is unknown, not location-less.
+            sections.location = bulk;
+            if (verdict.kind === "unusable") state.loc_unusable++;
+            else state.loc_unavailable++;
+            if (!bulk) noLocationReason = "loc_unresolved";
           }
         }
         try {
-          const outcome = await writeOne(job, sections);
+          const outcome = await writeOne(job, sections, noLocationReason);
           if (outcome === "done") done++;
           else if (outcome === "dropped") dropped++;
           else if (outcome === "stale") stale++;
+          else if (outcome === "unresolved") unresolved++;
         } catch (e) {
           console.error(`[${tag}] write error for ${job.id}: ${String(e).slice(0, 200)}`);
           missing.push(job.id);
@@ -861,7 +977,8 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
       state.jobs_written += done;
       state.jobs_dropped += dropped;
       state.jobs_stale += stale;
-      console.log(`[${tag}] of ${jobs.length}: done=${done} no_location=${dropped} stale=${stale} released=${missing.length}, ${tokens} tokens`);
+      state.jobs_unresolved += unresolved;
+      console.log(`[${tag}] of ${jobs.length}: done=${done} no_location=${dropped} unresolved=${unresolved} stale=${stale} released=${missing.length}, ${tokens} tokens`);
     } catch (e) {
       console.error(`[${tag}] lane error: ${String(e).slice(0, 300)}`);
       await sleep(5000);
@@ -998,7 +1115,7 @@ setInterval(() => {
 // heartbeat so you always see it alive in the Render logs
 setInterval(async () => {
   const pending = await pendingCount();
-  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} no_location=${state.jobs_dropped} stale=${state.jobs_stale} lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
+  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} no_location=${state.jobs_dropped} unresolved=${state.jobs_unresolved} stale=${state.jobs_stale} loc[asked=${state.loc_reasoned} resolved=${state.loc_resolved} none=${state.loc_none} unusable=${state.loc_unusable} unavailable=${state.loc_unavailable} cap=${state.loc_skipped_cap}] lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
 }, 30_000);
 
 console.log(`[init] worker up: ${state.lanes_total} lanes`);
