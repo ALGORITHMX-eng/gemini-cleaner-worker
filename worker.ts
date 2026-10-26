@@ -1,5 +1,12 @@
 // worker.ts - runs on Render (Docker + Deno). No Inngest.
-// - LANES_PER_KEY lanes per Gemini key, each lane = claim -> Gemini -> write -> repeat
+// v3 (LLM answer is final):
+// - jobs_pending has NO location / workplace type / employment type. The model reads them from the posting
+//   text (including the "Label: value" lines at the top) and whatever it returns is what gets stored.
+// - No regex, word list, evidence check or default in code overrides or contradicts the model.
+// - The ONLY reason a job is thrown away is no location (or a stale date). A missing workplace type or
+//   employment type is simply stored empty (null). Nothing goes to jobs_needs_review any more.
+// - temperature 0 and thinking off on every provider.
+// - LANES_PER_KEY lanes per key, each lane = claim -> model -> write -> repeat
 // - freshness check every 10 min + daily proof
 // - every step is logged so you can SEE it working in the Render logs
 // Copy ../_shared/redis.ts next to this file (same folder) for markHashesSeen.
@@ -30,14 +37,15 @@ const DAILY_CAP = Number(Deno.env.get("DAILY_CAP") ?? (USE === "nvidia" ? 5000 :
 const LANES_PER_KEY = Number(Deno.env.get("LANES_PER_KEY") ?? 10);
 const IDLE_MS = 15_000;
 const GEMINI_TIMEOUT_MS = Number(Deno.env.get("LLM_TIMEOUT_MS") ?? 120_000);
-const MAX_CHARS = 10000;
+const MAX_CHARS = 17000; // content characters sent per job (the label lines are at the top, so they always fit)
+const MAX_BATCH_CHARS = Number(Deno.env.get("MAX_BATCH_CHARS") ?? 200_000); // a call never carries more content than this; extra jobs go back to pending
 const EXPIRES_DAYS = 90;
-const REQUIRE_REAL_LOCATION = true;
+const MAX_AGE_DAYS = Number(Deno.env.get("MAX_AGE_DAYS") ?? 30); // a posting the model dates older than this is dropped as stale. 0 = keep everything
 const STORE_RAW_TEXT = false;
-const GLOBAL_LABEL = "Worldwide";
+const GLOBAL_LABEL = "Worldwide"; // the word the model is told to use when a posting is open to anywhere
 const FRESHNESS_TABLE = "job_freshness";
-const REVIEW_REQUIRED = new Set(["workplace_type", "employment_type", "location"]);
 const INFLIGHT = "openrouter_inflight";
+const DAY_MS = 86_400_000;
 
 const FRESHNESS_SECRET = Deno.env.get("FRESHNESS_SECRET") || "";
 const CF_WORKER_URL = Deno.env.get("CF_WORKER_URL") || "";
@@ -60,7 +68,7 @@ function loadKeys(): { idx: number; key: string }[] {
   // also accept a single plain NVIDIA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY
   const plain = (Deno.env.get(KEY_PREFIX) ?? "").trim();
   if (plain && !seen.has(plain)) out.unshift({ idx: 1, key: plain });
-  console.log(`[init] provider=${USE} model=${MODEL || "(NOT SET)"} url=${GEMINI_URL} keys=${out.length} lanes_per_key=${LANES_PER_KEY} batch=${BATCH} timeout=${GEMINI_TIMEOUT_MS / 1000}s`);
+  console.log(`[init] provider=${USE} model=${MODEL || "(NOT SET)"} url=${GEMINI_URL} keys=${out.length} lanes_per_key=${LANES_PER_KEY} batch=${BATCH} timeout=${GEMINI_TIMEOUT_MS / 1000}s max_age_days=${MAX_AGE_DAYS}`);
   return out;
 }
 const KEYS = loadKeys();
@@ -83,12 +91,18 @@ const state = {
   batches_ok: 0,
   batches_failed: 0,
   jobs_written: 0,
+  jobs_dropped: 0,
+  jobs_stale: 0,
   last_gemini_ms: 0,
   freshness_last_run: null as string | null,
 };
 
 // ---------------------------------------------------------------- prompt
-const SECTION_INSTRUCTIONS = `You receive several FULL job postings (already cleaned plain text, no HTML). Classify EACH job separately.
+// Built per call so the model always knows today's date (it needs it to read "posted 3 days ago").
+function buildInstructions(): string {
+  const today = new Date().toISOString().slice(0, 10);
+  return `You receive several FULL job postings (already cleaned plain text, no HTML). Classify EACH job separately.
+Each posting starts with its Title and URL. The text after that usually begins with a few "Label: value" lines copied from the company's own job board (for example "Location:", "All locations:", "Office:", "Country:", "Workplace type:", "Remote status:", "Employment type:", "Posted:", "Compensation:"), followed by the description. Nobody tells you the location, workplace type, employment type or posting date: you read them from the title, the URL, those label lines and the description. Label lines are explicit statements and you may quote them.
 For every job, classify every relevant sentence into exactly one of these sections:
 - role_description: what the job IS, day-to-day duties, what the person will do
 - requirements: concrete skills, tools, and soft requirements the person MUST have
@@ -101,17 +115,18 @@ For every job, classify every relevant sentence into exactly one of these sectio
 - company_culture: mission, values, DEI/EEO legal boilerplate
 When a bullet mixes a skill with an experience threshold, split it across sections. Discard HTML/template junk. Never invent content not present in source. Preserve original language.
 Additionally extract every distinct technical skill, tool, language, framework, or platform mentioned anywhere in the posting into a flat, deduplicated array called "extracted_skills". Normalize casing to how the skill is conventionally written (e.g. "JavaScript" not "javascript", "AWS" not "aws"). Do not include soft skills, years-of-experience phrases, or degree requirements.
-Also extract these fields by reading the WHOLE posting for an explicit statement — never guess or infer from context. The work arrangement or employment type is often one sentence far from the top.
-- "workplace_evidence": FIRST find the exact short phrase (under 25 words, copied word-for-word from the posting) that states whether the role is remote, hybrid or onsite. null if the posting has no such phrase. Fill this BEFORE detected_workplace_type.
-- "detected_workplace_type": one of "REMOTE", "HYBRID", "ONSITE", or null. Set it ONLY from workplace_evidence. If workplace_evidence is null this MUST be null. A city/office address alone is NOT a statement of arrangement. If the phrase says "hybrid" (even next to "onsite" or "in office"), the answer is HYBRID. Ignore "remote monitoring", "remote sensing", "hybrid cloud" or "hybrid vehicles". A company-level blurb such as "we are a remote-first company" is NOT evidence about this role unless the posting says this role itself is remote.
-- "employment_evidence": the exact short phrase (under 25 words, copied word-for-word) that states the type of employment. null if there is none.
-- "detected_employment_type": one of "FULL_TIME", "PART_TIME", "CONTRACT", "TEMPORARY", "INTERNSHIP", "VOLUNTEER", or null. Set it ONLY from employment_evidence. "contract assignment" or "fixed-term contract position" means CONTRACT. "employment contract" or "subject to contract" is NOT evidence. "40 hours per week" about THIS role counts as FULL_TIME. A title containing the whole word "Intern" or "Internship" counts as INTERNSHIP. Do not infer from salary or seniority.
-- "location_evidence": the exact short phrase (under 25 words, copied word-for-word from the Location line, the title, the description, or the job URL) that says where the candidate must be based, or that the job is open worldwide. null if nothing says it.
-- "location_scope": one of "WORLDWIDE", "RESTRICTED", "PLACE", "UNKNOWN". WORLDWIDE only when the posting explicitly says anywhere / worldwide. RESTRICTED when it hard-limits countries. PLACE when it names a city, office or country. UNKNOWN when nothing is stated. A global company is NOT WORLDWIDE.
-- "location_value": for RESTRICTED or PLACE only. FULL ENGLISH COUNTRY NAMES, never US/USA/UK. Format "City, Country" or "City, State, Country". You may use the URL host with the posting (galvestoncountytx plus "County of Galveston" → "Galveston, Texas, United States"). If you can name the city but not the country, return the city only. Never guess a country when the name exists in more than one country. Never infer a country from the company name alone. Do NOT include the words remote, hybrid or onsite. null for WORLDWIDE and UNKNOWN.
+Also read the fields below from the WHOLE posting. Your answer is FINAL: it is stored exactly as you give it and nothing in code checks or corrects it. So answer only from what the posting explicitly says, never guess or infer from context. If the posting does not state a field, return null. A null workplace_type or employment_type is simply left empty, and a null location (no place stated at all) means the job is thrown away, so never invent one to save a job. A guessed value is a failure. The work arrangement or employment type is often one sentence far from the top. Today's date is ${today}.
+- "workplace_evidence": FIRST find the exact short phrase (under 25 words, copied word-for-word from the posting) that states whether the role is remote, hybrid or onsite. A label line such as "Workplace type: OnSite" or "Remote status: hybrid" is valid evidence; a label whose value is blank, unspecified or not specified is NOT. null if the posting has no such phrase. Fill this BEFORE workplace_type.
+- "workplace_type": one of "REMOTE", "HYBRID", "ONSITE", or null. Set it ONLY from workplace_evidence. If workplace_evidence is null this MUST be null. A city/office address alone is NOT a statement of arrangement. If the phrase says "hybrid" (even next to "onsite" or "in office"), the answer is HYBRID. Ignore "remote monitoring", "remote sensing", "hybrid cloud" or "hybrid vehicles". A company-level blurb such as "we are a remote-first company" is NOT evidence about this role unless the posting says this role itself is remote.
+- "employment_evidence": the exact short phrase (under 25 words, copied word-for-word) that states the type of employment. A label line such as "Employment type: FullTime" is valid evidence. null if there is none. Fill this BEFORE employment_type.
+- "employment_type": one of "FULL_TIME", "PART_TIME", "CONTRACT", "TEMPORARY", "INTERNSHIP", "VOLUNTEER", or null. Set it ONLY from employment_evidence. Map label values the obvious way: FullTime or Full-time = FULL_TIME, PartTime or Part-time = PART_TIME, Contract, Contractor or Freelance = CONTRACT, Temp or Temporary = TEMPORARY, Intern or Internship = INTERNSHIP. "contract assignment" or "fixed-term contract position" means CONTRACT. "employment contract" or "subject to contract" is NOT evidence. "40 hours per week" about THIS role counts as FULL_TIME. A title containing the whole word "Intern" or "Internship" counts as INTERNSHIP. Do not infer from salary or seniority.
+- "location_evidence": the exact short phrase(s) (copied word-for-word) from the "Location", "All locations", "Office" or "Country" label lines, the title or the description that state where the candidate must be based, or that the job is open worldwide. null if nothing states it. Fill this BEFORE location.
+- "location": where the candidate must be based, or null. Write the place(s) EXACTLY as the posting states them: a city, a city and state, a state or province, a country, a city and country, a region, or several of these. Whatever the posting states is the answer, even if it is only a city or only a country. NEVER invent, complete or work out any part that is not written: do not add a country to a city or to "Austin, TX", do not expand state codes, and do not get a place from the company name, the URL, the language or the currency. If the posting states both a city and a country (the country may come from a separate "Country:" label line) write "City, Country" or "City, State, Country". Write "${GLOBAL_LABEL}" ONLY when the posting explicitly says anywhere / any country; a global company is NOT worldwide. A mere preference such as "ideally in a US time zone" is NOT a location. null ONLY when the posting states no place at all (for example just "Remote"). When several places are listed keep all of them, separated by " | ". Write country names as full English names (US/USA = United States, UK = United Kingdom). Do NOT include the words remote, hybrid or onsite.
+- "posted_date": the date this job was posted as YYYY-MM-DD, from a "Posted:" or "First published:" line or a phrase like "Posted on March 3, 2026". A relative phrase such as "Posted 3 Days Ago" or "30+ Days Ago" counts: work the date out from today's date (for "30+ Days Ago" use 30 days). "Updated" and "Valid through" dates do NOT count. null if the posting gives no posting date.
 Copy each job's "id" exactly. Do not skip a job. Do not add jobs.
 Respond with ONLY this JSON shape, no markdown:
-{"results":[{"id":"...","role_description":"...","requirements":"...","nice_to_have":"...","qualifications":"...","compensation":"...","benefits":"...","work_setup":"...","about_company":"...","company_culture":"...","extracted_skills":["..."],"workplace_evidence":null,"detected_workplace_type":null,"employment_evidence":null,"detected_employment_type":null,"location_evidence":null,"location_scope":"UNKNOWN","location_value":null}]}`;
+{"results":[{"id":"...","role_description":"...","requirements":"...","nice_to_have":"...","qualifications":"...","compensation":"...","benefits":"...","work_setup":"...","about_company":"...","company_culture":"...","extracted_skills":["..."],"workplace_evidence":null,"workplace_type":null,"employment_evidence":null,"employment_type":null,"location_evidence":null,"location":null,"posted_date":null}]}`;
+}
 
 interface SectionResult {
   id?: string;
@@ -126,12 +141,12 @@ interface SectionResult {
   company_culture?: string;
   extracted_skills?: string[];
   workplace_evidence?: string | null;
-  detected_workplace_type?: string | null;
+  workplace_type?: string | null;
   employment_evidence?: string | null;
-  detected_employment_type?: string | null;
+  employment_type?: string | null;
   location_evidence?: string | null;
-  location_scope?: string | null;
-  location_value?: string | null;
+  location?: string | null;
+  posted_date?: string | null;
 }
 
 interface Normalized {
@@ -146,13 +161,10 @@ interface Normalized {
   company_culture: string;
   full_description: string;
   extracted_skills: string[];
-  workplace_evidence: string | null;
-  detected_workplace_type: string | null;
-  employment_evidence: string | null;
-  detected_employment_type: string | null;
-  location_evidence: string | null;
-  location_scope: string | null;
-  location_value: string | null;
+  workplace_type: string | null;
+  employment_type: string | null;
+  location: string | null;
+  posted_at: string | null; // ISO, from the model's posted_date
 }
 
 function stripHtmlArtifacts(text: string): string {
@@ -179,8 +191,32 @@ function decodeEntities(t: string | null | undefined): string {
   return String(t ?? "").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
     .replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'").replace(/&nbsp;/gi, " ").trim();
 }
+
+// Only turns the model's reply into the shape the database wants. It never second-guesses the model:
+// a value outside the allowed list can't be stored, so it becomes null (left empty).
 const VALID_WORKPLACE = new Set(["REMOTE", "HYBRID", "ONSITE"]);
 const VALID_EMPTYPE = new Set(["FULL_TIME", "PART_TIME", "CONTRACT", "TEMPORARY", "INTERNSHIP", "VOLUNTEER"]);
+const NO_ANSWER = new Set(["", "null", "none", "unknown", "n/a", "na", "not stated", "not specified"]);
+
+function enumOrNull(v: unknown, valid: Set<string>): string | null {
+  // "On-site", "on site", "full time", "Full-Time" all map to the allowed value; anything else is null
+  const squash = (x: string) => x.toUpperCase().replace(/[\s_-]+/g, "");
+  const s = squash(String(v ?? ""));
+  for (const allowed of valid) if (squash(allowed) === s) return allowed;
+  return null;
+}
+
+function textOrNull(v: unknown, max: number): string | null {
+  const s = String(v ?? "").replace(/\s+/g, " ").trim();
+  return NO_ANSWER.has(s.toLowerCase()) ? null : s.slice(0, max);
+}
+
+function isoFromDay(v: unknown): string | null {
+  const s = String(v ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const t = Date.parse(s + "T00:00:00Z");
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
 
 function normalizeSections(raw: SectionResult): Normalized {
   const role_description = stripHtmlArtifacts(raw.role_description ?? "");
@@ -197,118 +233,18 @@ function normalizeSections(raw: SectionResult): Normalized {
   const extracted_skills = Array.isArray(raw.extracted_skills)
     ? [...new Set(raw.extracted_skills.map((s) => String(s).trim()).filter(Boolean))]
     : [];
-  const wp = String(raw.detected_workplace_type || "").toUpperCase().trim();
-  const et = String(raw.detected_employment_type || "").toUpperCase().trim();
-  const scope = String(raw.location_scope || "").toUpperCase().trim();
   return {
     role_description, requirements, nice_to_have, qualifications, compensation, benefits,
     work_setup, about_company, company_culture, full_description, extracted_skills,
-    workplace_evidence: raw.workplace_evidence ? String(raw.workplace_evidence) : null,
-    detected_workplace_type: VALID_WORKPLACE.has(wp) ? wp : null,
-    employment_evidence: raw.employment_evidence ? String(raw.employment_evidence) : null,
-    detected_employment_type: VALID_EMPTYPE.has(et) ? et : null,
-    location_evidence: raw.location_evidence ? String(raw.location_evidence) : null,
-    location_scope: ["WORLDWIDE", "RESTRICTED", "PLACE", "UNKNOWN"].includes(scope) ? scope : "UNKNOWN",
-    location_value: raw.location_value ? String(raw.location_value).slice(0, 200) : null,
+    workplace_type: enumOrNull(raw.workplace_type, VALID_WORKPLACE),
+    employment_type: enumOrNull(raw.employment_type, VALID_EMPTYPE),
+    location: textOrNull(raw.location, 2000),
+    posted_at: isoFromDay(raw.posted_date),
   };
 }
 
 function isAcceptableResult(sections: Normalized): boolean {
   return sections.full_description.length >= 80;
-}
-
-// ---------------------------------------------------------------- location logic
-const OPEN_KEYS = new Set(["worldwide", "world-wide", "anywhere", "global"]);
-const REGION_WORDS = new Set([
-  "africa", "sub-saharan africa", "emea", "mea", "west africa", "east africa", "north africa",
-  "central africa", "southern africa", "europe", "north america", "americas", "south america",
-  "latam", "latin america", "asia", "apac", "oceania",
-]);
-const CITY_WORDS = new Set([
-  "lagos", "abuja", "ile-ife", "ibadan", "kano", "port harcourt", "nairobi", "mombasa", "accra",
-  "kumasi", "johannesburg", "cape town", "durban", "kigali", "kampala", "dakar", "addis ababa",
-  "london", "manchester", "birmingham", "new york", "san francisco", "seattle", "austin", "chicago",
-  "boston", "los angeles", "toronto", "vancouver", "berlin", "paris", "amsterdam", "madrid",
-  "stockholm", "dubai", "mumbai", "bangalore", "bengaluru", "hyderabad", "singapore", "sydney",
-  "melbourne", "sao paulo", "dublin", "edinburgh", "zurich", "lisbon", "rome", "milan", "warsaw",
-  "prague", "vienna", "brussels", "copenhagen", "helsinki", "oslo", "tokyo", "seoul", "taipei",
-  "hong kong", "shanghai", "beijing", "shenzhen", "tel aviv", "cairo", "casablanca", "tunis",
-  "pretoria", "abu dhabi", "doha", "riyadh", "delhi", "pune", "chennai", "gurgaon",
-  "mountain view", "palo alto", "sunnyvale", "redmond", "denver", "atlanta", "miami", "dallas",
-  "houston", "philadelphia", "washington", "concord", "el segundo", "galveston",
-]);
-const COUNTRY_WORDS = new Set(`
-afghanistan albania algeria andorra angola argentina armenia australia austria azerbaijan
-bahamas bahrain bangladesh barbados belarus belgium belize benin bhutan bolivia bosnia botswana
-brazil brunei bulgaria burkina cameroon canada cape verde chad chile china colombia congo
-costa rica croatia cuba cyprus czech republic czechia denmark djibouti ecuador egypt
-el salvador eritrea estonia eswatini ethiopia fiji finland france gabon gambia georgia germany
-ghana greece grenada guatemala guinea guyana haiti honduras hungary iceland india indonesia
-iran iraq ireland israel italy jamaica japan jordan kazakhstan kenya kuwait kyrgyzstan laos
-latvia lebanon lesotho liberia libya liechtenstein lithuania luxembourg madagascar malawi
-malaysia maldives mali malta mauritania mauritius mexico moldova monaco mongolia montenegro
-morocco mozambique myanmar namibia nepal netherlands new zealand nicaragua niger nigeria
-north macedonia norway oman pakistan panama papua new guinea paraguay peru philippines poland
-portugal qatar romania russia rwanda samoa san marino saudi arabia senegal serbia seychelles
-sierra leone singapore slovakia slovenia somalia south africa south korea spain sri lanka
-sudan sweden switzerland syria taiwan tajikistan tanzania thailand timor-leste togo tunisia
-turkey turkmenistan uganda ukraine united arab emirates united kingdom united states uruguay
-uzbekistan venezuela vietnam yemen zambia zimbabwe usa uk britain england scotland wales
-uae holland
-`.split(/\s+/).map((s) => s.trim()).filter(Boolean).concat([
-  "united states", "united kingdom", "united states of america", "united arab emirates",
-  "south africa", "south korea", "new zealand", "saudi arabia", "sri lanka", "costa rica",
-  "el salvador", "sierra leone", "czech republic", "dominican republic", "north macedonia",
-  "papua new guinea", "burkina faso", "cape verde", "great britain", "northern ireland",
-]));
-
-const LOC_NOISE_RE = /\b(remote|hybrid|on-?site|fully|wfh|work from home|based|only|within|in)\b/gi;
-const WORK_MODE_RE = /\b(remote|hybrid|on-?site|onsite|in-?office|in\s+office|work\s+from\s+home|wfh|telecommut\w*|days?\s+per\s+week\s+(?:in\s+)?(?:the\s+)?office|\d+\s+days?\s+(?:on-?site|onsite|in\s+(?:the\s+)?office|remote)|office\s+based|fully\s+remote|remote-?first)\b/i;
-const BARE_PLACE_RE = /^(?:(?:fully\s+)?remote|hybrid|on-?site|wfh|work[\s-]*from[\s-]*home)$/i;
-
-function normText(t: string): string {
-  return (t || "").toLowerCase().match(/[a-z0-9]+/g)?.join(" ") ?? "";
-}
-
-function evidenceOk(evidence: string | null | undefined, hay: string): boolean {
-  if (!evidence || typeof evidence !== "string") return false;
-  const pieces = evidence.split(/\.\.\.|…/).map(normText).filter(Boolean);
-  return pieces.length > 0 && pieces.every((p) => hay.includes(p));
-}
-
-function workplaceEvidenceOk(evidence: string | null | undefined, hay: string): boolean {
-  return evidenceOk(evidence, hay) && WORK_MODE_RE.test(evidence || "");
-}
-
-function locKeys(text: string): string[] {
-  const t = (text || "").toLowerCase().replace(LOC_NOISE_RE, " ");
-  const out: string[] = [];
-  for (const part of t.split(/\s[-–—]\s|[,;|/()]+|\s(?:or|and)\s/)) {
-    const cleaned = part.replace(/\s+/g, " ").trim();
-    if (cleaned) out.push(cleaned);
-  }
-  return out;
-}
-
-function locKnown(key: string): boolean {
-  return OPEN_KEYS.has(key) || REGION_WORDS.has(key) || CITY_WORDS.has(key) || COUNTRY_WORDS.has(key);
-}
-
-function locClass(text: string): "EMPTY" | "GLOBAL_OK" | "SPECIFIC_OK" | "UNREADABLE" {
-  const t = (text || "").trim();
-  if (!t || /^\d+\s+locations?$/i.test(t)) return "EMPTY";
-  if (BARE_PLACE_RE.test(t)) return "EMPTY";
-  const keys = locKeys(t);
-  if (keys.some((k) => OPEN_KEYS.has(k))) return "GLOBAL_OK";
-  if (keys.some(locKnown)) return "SPECIFIC_OK";
-  return "UNREADABLE";
-}
-
-function isRealPlace(text: string): boolean {
-  const t = (text || "").trim();
-  if (!t) return false;
-  const c = locClass(t);
-  return c === "GLOBAL_OK" || c === "SPECIFIC_OK";
 }
 
 function getJobContent(job: any): string {
@@ -319,32 +255,8 @@ function getJobContent(job: any): string {
   return "";
 }
 
-function decideLocation(job: any, sections: Normalized): { final: string; changed: boolean; note: string } {
-  const hay = normText(`${job.title || ""} ${job.location || ""} ${job.job_url || ""} ${getJobContent(job)}`);
-  const scraped = String(job.location || "").trim();
-  const cls = locClass(scraped);
-  const scope = sections.location_scope;
-  if (!scope || !["WORLDWIDE", "RESTRICTED", "PLACE"].includes(scope) || !evidenceOk(sections.location_evidence, hay)) {
-    return { final: scraped, changed: false, note: "" };
-  }
-  let value = String(sections.location_value || "").replace(/\b(remote|hybrid|on-?site)\b/gi, " ");
-  value = value.replace(/\s*[-–—]\s*(?=,|$)/g, "").replace(/\s+/g, " ").replace(/^[\s,;|/-]+|[\s,;|/-]+$/g, "");
-  const valueOk = Boolean(value) && locClass(value) === "SPECIFIC_OK";
-  if (scope === "WORLDWIDE") {
-    if (cls === "GLOBAL_OK") return { final: scraped, changed: false, note: "" };
-    return { final: GLOBAL_LABEL, changed: true, note: "posting says worldwide" };
-  }
-  if (valueOk) {
-    const scrapedKeys = new Set(locKeys(scraped));
-    if (cls === "SPECIFIC_OK" && locKeys(value).some((k) => scrapedKeys.has(k))) {
-      return { final: scraped, changed: false, note: "" };
-    }
-    return { final: value.slice(0, 200), changed: true, note: "posting names a place" };
-  }
-  return { final: scraped, changed: false, note: "" };
-}
-
-function postedIso(v: unknown): string | null {
+// only used when the model gave no date but the scraper row already carried one
+function scrapedPostedIso(v: unknown): string | null {
   if (v == null || v === "") return null;
   if (typeof v === "string" && v.includes("T")) return v;
   const n = typeof v === "number" ? v : Number(v);
@@ -395,6 +307,19 @@ function clip(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n);
 }
 
+// Keep a call inside MAX_BATCH_CHARS of content: the jobs that do not fit go back to pending for the next call.
+function fitBatch(jobs: any[]): { keep: any[]; extra: any[] } {
+  const keep: any[] = [], extra: any[] = [];
+  let total = 0;
+  for (const j of jobs) {
+    const n = Math.min(getJobContent(j).length, MAX_CHARS) + 300;
+    if (keep.length && total + n > MAX_BATCH_CHARS) extra.push(j);
+    else { keep.push(j); total += n; }
+  }
+  return { keep, extra };
+}
+
+// No Location line here on purpose: nothing supplies one. The label lines inside the body are the source.
 function buildUserMessage(jobs: any[]): string {
   return jobs.map((job) => {
     const body = clip(getJobContent(job), MAX_CHARS);
@@ -402,7 +327,6 @@ function buildUserMessage(jobs: any[]): string {
       `JOB id=${job.id}`,
       `Title: ${job.title || ""}`,
       `URL: ${job.job_url || ""}`,
-      `Location: ${job.location || ""}`,
       "",
       body,
     ].join("\n");
@@ -539,76 +463,34 @@ async function recoverStuck() {
   else console.log(`[recover] released ${data?.length ?? 0} stuck jobs`);
 }
 
-async function skipNoLocation(job: any) {
-  const { error } = await supabase.from("jobs_pending").update({
-    status: "failed",
-    updated_at: new Date().toISOString(),
-    last_error: "bare_remote_or_empty_location",
-  }).eq("id", job.id);
-  if (error) await supabase.from("jobs_pending").update({ status: "failed" }).eq("id", job.id);
-}
-
 // ---------------------------------------------------------------- write one job
+// Returns: "done" | "dropped" | "stale" | "deferred". Throws on a db error so the lane can count a strike.
 async function writeOne(job: any, sections: Normalized): Promise<string> {
-  const hay = normText(`${job.title || ""} ${job.location || ""} ${job.job_url || ""} ${getJobContent(job)}`);
-  let detectedWorkplace = sections.detected_workplace_type;
-  let detectedEmp = sections.detected_employment_type;
-  if (!workplaceEvidenceOk(sections.workplace_evidence, hay)) detectedWorkplace = null;
-  else if (sections.workplace_evidence && (/\bhybrid\b/i.test(sections.workplace_evidence) || (/\bremote\b/i.test(sections.workplace_evidence) && /\b(on-?site|onsite|office)\b/i.test(sections.workplace_evidence)))) {
-    detectedWorkplace = "HYBRID";
+  const content = getJobContent(job);
+  // the model's answers, stored exactly as given (null = the posting does not say)
+  const { workplace_type: workplace, employment_type: employment, location } = sections;
+  const postedAt = sections.posted_at ?? scrapedPostedIso(job.posted_at);
+
+  // No location = the job is thrown away. Nothing else makes a job get thrown away except a stale date.
+  if (!location) {
+    const { error } = await supabase.from("jobs_pending")
+      .update({ status: "failed", last_error: "no_location" }).eq("id", job.id);
+    if (error) throw new Error(`no_location update failed: ${error.message}`);
+    return "dropped";
   }
-  if (!evidenceOk(sections.employment_evidence, hay)) detectedEmp = null;
-  const scrapeWorkplace = String(job.workplace_type || job.job_type || "").toUpperCase() || null;
-  const scrapeEmp = String(job.employment_type || "").toUpperCase() || null;
-  let finalWorkplace = (detectedWorkplace || (VALID_WORKPLACE.has(scrapeWorkplace || "") ? scrapeWorkplace : null)) as string | null;
-  let finalEmp = (detectedEmp || (VALID_EMPTYPE.has(scrapeEmp || "") ? scrapeEmp : null)) as string | null;
-  const decided = decideLocation(job, sections);
-  let finalLocation = decided.final;
-  if (finalLocation && locClass(finalLocation) === "EMPTY") finalLocation = "";
-  if (!isRealPlace(finalLocation)) {
-    let alt = String(sections.location_value || "").replace(/\b(remote|hybrid|on-?site)\b/gi, " ");
-    alt = alt.replace(/\s+/g, " ").replace(/^[\s,;|/-]+|[\s,;|/-]+$/g, "");
-    if (isRealPlace(alt)) finalLocation = alt.slice(0, 200);
-  }
-  if (REQUIRE_REAL_LOCATION && !isRealPlace(finalLocation)) {
-    await skipNoLocation(job);
-    return "skipped_loc";
-  }
-  const body = `${job.title || ""} ${getJobContent(job)}`;
-  const hasWorkMode = /\b(remote|hybrid|on-?site|work from home|wfh|telecommut)\b/i.test(body);
-  const placeClass = locClass(finalLocation);
-  if (!finalWorkplace) {
-    if (placeClass === "GLOBAL_OK") finalWorkplace = "REMOTE";
-    else if (placeClass === "SPECIFIC_OK" && !hasWorkMode) finalWorkplace = "ONSITE";
-  }
-  if (!finalEmp) finalEmp = "FULL_TIME";
-  const missing = [
-    ["workplace_type", Boolean(finalWorkplace)],
-    ["employment_type", Boolean(finalEmp)],
-    ["location", Boolean(finalLocation) && placeClass !== "EMPTY"],
-  ].filter(([name, found]) => !found && REVIEW_REQUIRED.has(String(name))).map(([name]) => name);
-  if (missing.length) {
-    const { error } = await supabase.from("jobs_needs_review").upsert({
-      job_url: job.job_url,
-      job_url_normalized: job.job_url_normalized,
-      dedup_hash: job.dedup_hash,
-      company: job.company || "Unknown",
-      title: job.title,
-      location: job.location || "",
-      content: getJobContent(job),
-      source: job.source,
-      pipe: job.pipe || "pipe1",
-      posted_at: job.posted_at ?? null,
-      employment_type: finalEmp,
-      reason: "missing_after_llm: " + missing.join(", "),
-    }, { onConflict: "dedup_hash" });
-    if (!error) {
-      await supabase.from("jobs_pending").update({ status: "done", last_error: null }).eq("id", job.id);
-      return "needs_review";
+
+  if (MAX_AGE_DAYS > 0 && postedAt) {
+    const ageDays = (Date.now() - Date.parse(postedAt)) / DAY_MS;
+    if (Number.isFinite(ageDays) && ageDays > MAX_AGE_DAYS) {
+      const { error } = await supabase.from("jobs_pending")
+        .update({ status: "failed", last_error: "stale_posting" }).eq("id", job.id);
+      if (error) throw new Error(`stale update failed: ${error.message}`);
+      return "stale";
     }
   }
+
   const salary = extractSalaryFromCompensation(sections.compensation);
-  const expiresIso = new Date(Date.now() + EXPIRES_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const expiresIso = new Date(Date.now() + EXPIRES_DAYS * DAY_MS).toISOString();
   if (job.job_url_normalized) {
     const { data: sameUrl } = await supabase.from("jobs_master").select("id, dedup_hash").eq("job_url_normalized", job.job_url_normalized).maybeSingle();
     if (sameUrl && sameUrl.dedup_hash !== job.dedup_hash) {
@@ -623,14 +505,14 @@ async function writeOne(job: any, sections: Normalized): Promise<string> {
     dedup_hash: job.dedup_hash,
     company: job.company || "Unknown",
     role: decodeEntities(job.title),
-    location: finalLocation,
-    job_type: finalWorkplace,
-    workplace_type: finalWorkplace,
+    location,
+    job_type: workplace,
+    workplace_type: workplace,
     eligible_countries: job.eligible_countries ?? null,
     eligible_cities: job.eligible_cities ?? null,
-    employment_type: finalEmp,
+    employment_type: employment,
     regions: job.regions ?? null,
-    is_global: placeClass === "GLOBAL_OK" ? true : (job.is_global ?? null),
+    is_global: location.toLowerCase() === GLOBAL_LABEL.toLowerCase() ? true : (job.is_global ?? null),
     requires_us_citizenship: job.requires_us_citizenship ?? null,
     role_description: sections.role_description,
     requirements: sections.requirements,
@@ -642,11 +524,11 @@ async function writeOne(job: any, sections: Normalized): Promise<string> {
     about_company: sections.about_company,
     company_culture: sections.company_culture,
     extracted_skills: sections.extracted_skills,
-    posted_at: postedIso(job.posted_at),
+    posted_at: postedAt,
     salary_min: salary.min,
     salary_max: salary.max,
     salary_currency: salary.currency,
-    raw_text: STORE_RAW_TEXT ? getJobContent(job) : "",
+    raw_text: STORE_RAW_TEXT ? content : "",
     source: job.source,
     pipe: job.pipe || "pipe1",
     tag_source: "llm-labeled-gemini",
@@ -656,8 +538,8 @@ async function writeOne(job: any, sections: Normalized): Promise<string> {
     expires_at: expiresIso,
   }, { onConflict: "dedup_hash" });
   if (masterErr) {
-    await supabase.from("jobs_pending").update({ status: "pending", last_error: null }).eq("id", job.id);
-    return "deferred";
+    // throw (not silently retry forever): the lane counts a strike and the real reason shows in the logs
+    throw new Error(`jobs_master upsert failed: ${masterErr.message}`);
   }
   const { error: freshErr } = await supabase.from(FRESHNESS_TABLE).upsert({
     job_id: job.id,
@@ -685,23 +567,17 @@ class GeminiError extends Error {
 }
 
 const MAX_TOKENS = Number(Deno.env.get("MAX_TOKENS") ?? (USE === "gemini" ? 65000 : USE === "openrouter" ? 32000 : 16384));
-const NVIDIA_THINKING = Deno.env.get("NVIDIA_THINKING") === "1"; // set to 1 to let the model think first
+// thinking is OFF and temperature is 0 on every provider
+const GEMINI_REASONING = Deno.env.get("GEMINI_REASONING_EFFORT") ?? "none"; // if Gemini answers HTTP 400 to "none", set this env to "minimal" or "low"
 
 function buildBody(messages: unknown[]): Record<string, unknown> {
   if (USE === "nvidia") {
-    return {
-      model: MODEL,
-      messages,
-      max_tokens: MAX_TOKENS,
-      temperature: 0.2,
-      // thinking off by default so the JSON answer fits and comes back fast
-      ...(NVIDIA_THINKING ? {} : { chat_template_kwargs: { enable_thinking: false } }),
-    };
+    return { model: MODEL, messages, max_tokens: MAX_TOKENS, temperature: 0, chat_template_kwargs: { enable_thinking: false } };
   }
   if (USE === "openrouter") {
-    return { model: MODEL, messages, max_tokens: MAX_TOKENS, response_format: { type: "json_object" }, reasoning: { enabled: false } };
+    return { model: MODEL, messages, max_tokens: MAX_TOKENS, temperature: 0, response_format: { type: "json_object" }, reasoning: { enabled: false } };
   }
-  return { model: MODEL, messages, max_tokens: MAX_TOKENS, response_format: { type: "json_object" }, reasoning_effort: "low" };
+  return { model: MODEL, messages, max_tokens: MAX_TOKENS, temperature: 0, response_format: { type: "json_object" }, reasoning_effort: GEMINI_REASONING };
 }
 
 async function callGemini(apiKey: string, messages: unknown[]): Promise<any> {
@@ -733,8 +609,10 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
 
       if ((await pendingCount()) < MIN_PENDING) { await sleep(IDLE_MS); continue; }
 
-      const jobs = await claimBatch();
-      if (!jobs.length) { await sleep(IDLE_MS); continue; }
+      const claimed = await claimBatch();
+      if (!claimed.length) { await sleep(IDLE_MS); continue; }
+      const { keep: jobs, extra } = fitBatch(claimed);
+      if (extra.length) await release(extra.map((j: any) => j.id)); // did not fit this call, next call picks them up
 
       const slotId = await reserveCall(keyIdx);
       if (slotId == null) { await release(jobs.map((j: any) => j.id)); await sleep(5000); continue; }
@@ -749,7 +627,7 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
 
       const ids = jobs.map((j: any) => j.id);
       const messages = [
-        { role: "system", content: SECTION_INSTRUCTIONS },
+        { role: "system", content: buildInstructions() },
         { role: "user", content: buildUserMessage(jobs) },
       ];
 
@@ -821,7 +699,7 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
       }
 
       const byId = new Map(results.map((r) => [String(r.id || ""), r]));
-      let done = 0;
+      let done = 0, dropped = 0, stale = 0;
       const missing: string[] = [];
       for (const job of jobs) {
         const raw = byId.get(String(job.id));
@@ -830,7 +708,9 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         if (!isAcceptableResult(sections)) { missing.push(job.id); continue; }
         try {
           const outcome = await writeOne(job, sections);
-          if (outcome === "done" || outcome === "needs_review" || outcome === "skipped_loc") done++;
+          if (outcome === "done") done++;
+          else if (outcome === "dropped") dropped++;
+          else if (outcome === "stale") stale++;
         } catch (e) {
           console.error(`[${tag}] write error for ${job.id}: ${String(e).slice(0, 200)}`);
           missing.push(job.id);
@@ -843,7 +723,9 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
       await settleCall(slotId, tokens, true);
       state.batches_ok++;
       state.jobs_written += done;
-      console.log(`[${tag}] wrote ${done}/${jobs.length} (released ${missing.length}), ${tokens} tokens`);
+      state.jobs_dropped += dropped;
+      state.jobs_stale += stale;
+      console.log(`[${tag}] of ${jobs.length}: done=${done} no_location=${dropped} stale=${stale} released=${missing.length}, ${tokens} tokens`);
     } catch (e) {
       console.error(`[${tag}] lane error: ${String(e).slice(0, 300)}`);
       await sleep(5000);
@@ -980,7 +862,7 @@ setInterval(() => {
 // heartbeat so you always see it alive in the Render logs
 setInterval(async () => {
   const pending = await pendingCount();
-  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
+  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} no_location=${state.jobs_dropped} stale=${state.jobs_stale} lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
 }, 30_000);
 
 console.log(`[init] worker up: ${state.lanes_total} lanes`);
