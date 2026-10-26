@@ -302,6 +302,43 @@ function extractSalaryFromCompensation(compensationText: string) {
   return { min: parseAmt(rawMin, suffixMin), max: parseAmt(rawMax, suffixMax), currency };
 }
 
+// ---------------------------------------------------------------- compensation guard
+// The model occasionally writes one job's pay into another job's slot. Seen live: a
+// German posting (icb-gmbh.jobs.personio.de/job/2447659, no salary anywhere on the
+// page) came back carrying "a range of $125,500 - $175,700 ... 7.5 - 15% of base
+// salary", copied verbatim from a Credit Acceptance posting that shared its batch.
+// The text was real, the employer was wrong. So every money figure in the
+// compensation section must exist in THIS job's own source text; if one does not,
+// the whole section and the salary columns become empty (which is already the
+// accepted answer for "the posting states no pay"). Nothing is rewritten.
+function moneyValues(text: string): Set<number> {
+  const out = new Set<number>();
+  const re = /(?:[$€£₦₵]|US\$|C\$|USD|EUR|GBP|NGN|GHS|KES|ZAR|CAD)?\s?(\d[\d,.]*(?:\d))\s?([kKmM])?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(String(text || "")))) {
+    const raw = m[1];
+    // 125.000 (European thousands) vs 125,500 vs 54.5
+    const cleaned = /^\d{1,3}(\.\d{3})+$/.test(raw) ? raw.replace(/\./g, "") : raw.replace(/,/g, "");
+    let n = parseFloat(cleaned);
+    if (!Number.isFinite(n)) continue;
+    const suf = (m[2] || "").toLowerCase();
+    if (suf === "k") n *= 1000;
+    if (suf === "m") n *= 1000000;
+    if (n < 1000) continue;                       // percentages, 7.5, 15
+    if (n >= 1900 && n <= 2100) continue;         // stray years
+    out.add(Math.round(n));
+  }
+  return out;
+}
+
+function trustCompensation(comp: string, source: string): { text: string; missing: number[] } {
+  const claimed = moneyValues(comp);
+  if (!claimed.size) return { text: comp, missing: [] };   // no figures to verify
+  const inSource = moneyValues(source);
+  const missing = [...claimed].filter((n) => !inSource.has(n));
+  return missing.length ? { text: "", missing } : { text: comp, missing: [] };
+}
+
 // ---------------------------------------------------------------- prompt building + parsing
 function clip(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n);
@@ -489,7 +526,12 @@ async function writeOne(job: any, sections: Normalized): Promise<string> {
     }
   }
 
-  const salary = extractSalaryFromCompensation(sections.compensation);
+  // a pay figure the posting does not contain is a batch-contamination symptom, not data
+  const comp = trustCompensation(sections.compensation, content);
+  if (comp.missing.length) {
+    console.warn(`[comp-guard] ${job.id} (${job.company || "?"}): compensation dropped, figures not in this posting: ${comp.missing.slice(0, 5).join(", ")}`);
+  }
+  const salary = extractSalaryFromCompensation(comp.text);
   const expiresIso = new Date(Date.now() + EXPIRES_DAYS * DAY_MS).toISOString();
   if (job.job_url_normalized) {
     const { data: sameUrl } = await supabase.from("jobs_master").select("id, dedup_hash").eq("job_url_normalized", job.job_url_normalized).maybeSingle();
@@ -518,7 +560,7 @@ async function writeOne(job: any, sections: Normalized): Promise<string> {
     requirements: sections.requirements,
     nice_to_have: sections.nice_to_have,
     qualifications: sections.qualifications,
-    compensation: sections.compensation,
+    compensation: comp.text,
     benefits: sections.benefits,
     work_setup: sections.work_setup,
     about_company: sections.about_company,
