@@ -656,7 +656,15 @@ const GEMINI_REASONING = Deno.env.get("GEMINI_REASONING_EFFORT") ?? "none"; // i
 // obvious ones, reasoning for the ones that need it.
 const LOCATION_REASONING = (Deno.env.get("LOCATION_REASONING") ?? "on").toLowerCase() !== "off";
 const LOCATION_REASON_TOKENS = Number(Deno.env.get("LOCATION_REASON_TOKENS") ?? 3000);
-const LOCATION_REASON_CHARS = Number(Deno.env.get("LOCATION_REASON_CHARS") ?? 6000);
+// Places are resolved for a whole batch in ONE call, the same way the bulk pass
+// works. One call per job was costing ~0.4 calls/job — about 2x the bulk pass —
+// to return a single field.
+const LOCATION_BATCH = Number(Deno.env.get("LOCATION_BATCH") ?? 15);
+const LOCATION_ITEM_CHARS = Number(Deno.env.get("LOCATION_REASON_CHARS") ?? 900);
+const LOCATION_REASON_TIMEOUT_MS = Number(Deno.env.get("LOCATION_REASON_TIMEOUT_MS") ?? 180_000);
+// Thinking on nvidia means chat_template_kwargs.enable_thinking, which
+// nemotron-3.5-lightning answers with HTTP 500. Off unless explicitly enabled.
+const LOCATION_REASON_THINKING = (Deno.env.get("LOCATION_REASON_THINKING") ?? "off").toLowerCase() === "on";
 // The reasoning pass is only worth paying for if it is better at places than the
 // bulk model. Point it at a real reasoning model (same provider + key, different
 // model id). Empty = use MODEL, i.e. the old behaviour.
@@ -675,12 +683,12 @@ function buildBody(messages: unknown[], opts: { maxTokens?: number; thinking?: b
   return { model, messages, max_tokens, temperature: 0, response_format: { type: "json_object" }, reasoning_effort: think ? "low" : GEMINI_REASONING };
 }
 
-async function callGemini(apiKey: string, messages: unknown[], opts: { maxTokens?: number; thinking?: boolean; model?: string } = {}): Promise<any> {
+async function callGemini(apiKey: string, messages: unknown[], opts: { maxTokens?: number; thinking?: boolean; model?: string; timeoutMs?: number } = {}): Promise<any> {
   const res = await fetch(GEMINI_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify(buildBody(messages, opts)),
-    signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+    signal: AbortSignal.timeout(opts.timeoutMs ?? GEMINI_TIMEOUT_MS),
   });
   const text = await res.text();
   if (!res.ok) throw new GeminiError(res.status, text.slice(0, 300));
@@ -718,18 +726,23 @@ function cleanLocationAnswer(value: unknown): string {
     .join(" | ");
 }
 
+const BARE_OFFICE_RE = /^(HQ|Headquarters|Head Office|Office|Campus|Site|Plant|Factory|Multiple|Various)$/i;
+const BARE_PLACEHOLDER_RE = /^(all states|all locations|multiple locations|various locations|nationwide|anywhere)$/i;
+
 /**
  * Is this a place the product can actually show? Not a gazetteer and not a
- * country resolver (geo.ts owns that) — only a shape gate: every segment has to
- * name a country or be Worldwide, and a bare office label does not count.
- * "Belgium" passes. "Bangalore HQ" and "Nyeri" do not.
+ * country resolver (geo.ts owns that) — only a shape gate: it must not be an
+ * office label or a placeholder. It deliberately does NOT require a country from
+ * a hand-written list: that list is partial (no Iran, Iraq, Bolivia, Slovenia…)
+ * and it was rejecting correct answers like "Tehran, Iran".
+ * "Belgium" passes. "Bangalore HQ", "Headquarters" and "Location - All States" do not.
  */
 function isUsableLocation(value: unknown): boolean {
   const segs = cleanLocationAnswer(value).split("|").map((s) => s.trim()).filter(Boolean);
   if (!segs.length) return false;
   return segs.every((seg) => {
-    if (seg.toLowerCase() === GLOBAL_LABEL.toLowerCase()) return true;
-    if (!COUNTRY_RE.test(seg)) return false;
+    if (BARE_OFFICE_RE.test(seg)) return false;
+    if (BARE_PLACEHOLDER_RE.test(seg.replace(/^location\s*[-–:]\s*/i, ""))) return false;
     if (OFFICE_WORD_RE.test(seg) && seg.split(",").length < 2) return false;
     return true;
   });
@@ -761,63 +774,127 @@ type LocVerdict =
   | { kind: "unusable"; answer: string }
   | { kind: "unavailable"; why: string };
 
+/** The board's own "Location: / Office: / Country:" lines — the cheapest possible signal. */
+function locationLines(content: string): string {
+  const hits: string[] = [];
+  for (const line of String(content || "").split(/\n+/)) {
+    if (hits.length >= 5) break;
+    if (/^\s*(?:all locations?|location|office|country|city|region|workplace|remote status|job location)\s*:/i.test(line)) {
+      hits.push(line.trim().slice(0, 120));
+    }
+  }
+  return hits.join("\n");
+}
+
 /**
- * Second, thinking-ON call for one job's location only. Never throws — a failed
- * resolve must not cost the job, it just must not be mistaken for a verdict either.
+ * Resolve the places for a whole batch in ONE call. Same idea as the bulk pass:
+ * N jobs in, N answers out. Returns a verdict per job id; anything the model
+ * skipped comes back as "unavailable", never as a guess.
+ * Never throws — a failed batch must not cost the jobs.
  */
-async function reasonLocation(keyIdx: number, apiKey: string, job: any, current: any, content: string): Promise<LocVerdict> {
-  const slotId = await reserveCall(keyIdx);
-  if (slotId == null) {
-    state.loc_skipped_cap++; // over cap: keep the bulk answer, don't spend
-    return { kind: "unavailable", why: "cap" };
-  }
-  try {
-    const prompt = [
-      "Answer ONE question about this job posting: where is the candidate based?",
-      `Company: ${job.company ?? ""}`,
-      `Title: ${job.role ?? job.title ?? ""}`,
-      `Job URL: ${job.job_url ?? job.url ?? ""}`,
-      current ? `A fast pass answered: ${JSON.stringify(String(current))}` : "A fast pass found no place.",
-      "",
-      "Rules:",
-      '- Answer {"location": "<place>"} — "City, Country", or "City, State, Country" for the US.',
-      "- Resolve office names, company office labels and well-known cities/states to their country:",
-      '  "Bangalore HQ" -> "Bangalore, India"; "Dresden" -> "Dresden, Germany"; "Austin, TX" -> "Austin, TX, United States".',
-      '- A country on its own is a complete answer: "Location: Belgium" -> "Belgium". Never add a city it does not name.',
-      '- "Remote - United States" -> "United States". A remote job that names a country still has that country.',
-      '- A city district or campus is that city: "Nantes" -> "Nantes, France".',
-      "- Use the posting text, the company's offices and the job URL (Workday links often carry the place).",
-      '- Several places: join them with " | ", each resolved the same way.',
-      '- Nothing anywhere points to a place: answer {"location": null}. "Remote" with no country anywhere is null.',
-      "- Never invent a place. Do not include the words remote, hybrid or onsite.",
-      "",
-      "POSTING:",
-      String(content || "").slice(0, LOCATION_REASON_CHARS),
+async function reasonLocationsBatch(
+  keyIdx: number,
+  apiKey: string,
+  items: { id: string; job: any; current: any }[]
+): Promise<Map<string, LocVerdict>> {
+  const out = new Map<string, LocVerdict>();
+  if (!items.length) return out;
+
+  const blocks = items.map((it) => {
+    const content = getJobContent(it.job);
+    const lines = locationLines(content);
+    return [
+      `### id: ${it.id}`,
+      `Company: ${it.job.company ?? ""}`,
+      `Title: ${it.job.role ?? it.job.title ?? ""}`,
+      `Job URL: ${it.job.job_url ?? it.job.url ?? ""}`,
+      it.current ? `Fast pass answered: ${JSON.stringify(String(it.current))}` : "Fast pass found no place.",
+      lines ? `Board labels:\n${lines}` : "Board labels: (none)",
+      "Text:",
+      String(content || "").slice(0, LOCATION_ITEM_CHARS),
     ].join("\n");
+  });
 
-    const json = await callGemini(apiKey, [{ role: "user", content: prompt }], {
-      maxTokens: LOCATION_REASON_TOKENS,
-      thinking: true,
-      model: LOCATION_REASON_MODEL || undefined,
-    });
-    const tokens = (json?.usage?.prompt_tokens || 0) + (json?.usage?.completion_tokens || 0);
-    await settleCall(slotId, tokens, true);
+  const prompt = [
+    `Below are ${items.length} job postings. For EACH id, say where the candidate is based.`,
+    "",
+    "Answer with JSON only:",
+    '{"results":[{"id":"<id>","location":"<place>"}]}',
+    "One entry per id, same ids, nothing else.",
+    "",
+    "Rules:",
+    '- location is "City, Country", or "City, State, Country" for the US.',
+    "- Resolve office names, company office labels and well-known cities/states to their country:",
+    '  "Bangalore HQ" -> "Bangalore, India"; "Dresden" -> "Dresden, Germany"; "Austin, TX" -> "Austin, TX, United States".',
+    '- A country on its own is a complete answer: "Location: Belgium" -> "Belgium". Never add a city it does not name.',
+    '- "Remote - United States" -> "United States". A remote job that names a country still has that country.',
+    '- A city district or campus is that city: "Nantes" -> "Nantes, France".',
+    "- Use the board labels, the posting text, the company's offices and the job URL (Workday links carry the place).",
+    '- Several places: join them with " | ", each resolved the same way.',
+    '- Nothing anywhere points to a place: {"id":"<id>","location":null}. Bare "Remote" with no country is null.',
+    "- Never invent a place. Never answer with an office label such as HQ or Office.",
+    "",
+    "JOBS:",
+    blocks.join("\n\n"),
+  ].join("\n");
 
-    const raw = String(replyText(json) ?? "").replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
-    let parsed: any = null;
-    try { parsed = JSON.parse(raw); } catch { return { kind: "unavailable", why: "bad_json" }; }
-    if (!parsed || !("location" in parsed)) return { kind: "unavailable", why: "no_answer" };
-    if (parsed.location === null) return { kind: "none" };
-    if (typeof parsed.location !== "string") return { kind: "unavailable", why: "not_a_string" };
-    const clean = cleanLocationAnswer(parsed.location);
-    if (!clean) return { kind: "none" };
-    if (!isUsableLocation(clean)) return { kind: "unusable", answer: clean };
-    return { kind: "resolved", location: clean };
+  const attempt = async (thinking: boolean) => {
+    const slotId = await reserveCall(keyIdx);
+    if (slotId == null) { state.loc_skipped_cap++; throw new Error("cap"); }
+    try {
+      const json = await callGemini(apiKey, [{ role: "user", content: prompt }], {
+        maxTokens: Math.min(LOCATION_REASON_TOKENS, Math.max(1200, 140 * items.length)),
+        thinking,
+        model: LOCATION_REASON_MODEL || undefined,
+        timeoutMs: LOCATION_REASON_TIMEOUT_MS,
+      });
+      const tokens = (json?.usage?.prompt_tokens || 0) + (json?.usage?.completion_tokens || 0);
+      await settleCall(slotId, tokens, true);
+      return json;
+    } catch (e) {
+      await dropCall(slotId);
+      throw e;
+    }
+  };
+
+  let json: any = null;
+  try {
+    json = await attempt(LOCATION_REASON_THINKING);
   } catch (e) {
-    await dropCall(slotId);
-    console.warn(`[loc-reason] ${job.id}: ${String(e).slice(0, 160)}`);
-    return { kind: "unavailable", why: String(e).slice(0, 80) };
+    // thinking is the usual suspect on nvidia (HTTP 500) — one retry without it
+    if (LOCATION_REASON_THINKING && !/cap$/.test(String(e))) {
+      console.warn(`[loc-reason] ${items.length} jobs failed with thinking on, retrying flat: ${String(e).slice(0, 120)}`);
+      try { json = await attempt(false); } catch (e2) { console.warn(`[loc-reason] batch failed: ${String(e2).slice(0, 140)}`); }
+    } else {
+      console.warn(`[loc-reason] batch failed: ${String(e).slice(0, 140)}`);
+    }
   }
+  if (!json) {
+    for (const it of items) out.set(String(it.id), { kind: "unavailable", why: "batch_failed" });
+    return out;
+  }
+
+  const raw = String(replyText(json) ?? "").replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  let parsed: any = null;
+  try { parsed = JSON.parse(raw); } catch { parsed = null; }
+  const list: any[] = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.results) ? parsed.results : [];
+  if (!list.length) {
+    console.warn(`[loc-reason] unparsable batch reply, ${raw.length} chars: ${raw.slice(0, 120)}`);
+    for (const it of items) out.set(String(it.id), { kind: "unavailable", why: "bad_json" });
+    return out;
+  }
+
+  for (const it of items) {
+    const hit = list.find((r) => String(r?.id ?? "") === String(it.id));
+    if (!hit || !("location" in hit)) { out.set(String(it.id), { kind: "unavailable", why: "missing_from_reply" }); continue; }
+    if (hit.location === null || hit.location === "") { out.set(String(it.id), { kind: "none" }); continue; }
+    if (typeof hit.location !== "string") { out.set(String(it.id), { kind: "unavailable", why: "not_a_string" }); continue; }
+    const clean = cleanLocationAnswer(hit.location);
+    if (!clean) { out.set(String(it.id), { kind: "none" }); continue; }
+    if (!isUsableLocation(clean)) { out.set(String(it.id), { kind: "unusable", answer: clean }); continue; }
+    out.set(String(it.id), { kind: "resolved", location: clean });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- one lane = one worker loop
@@ -921,7 +998,11 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
       }
 
       const byId = new Map(results.map((r) => [String(r.id || ""), r]));
-      let done = 0, dropped = 0, stale = 0, unresolved = 0;
+
+      // (a) normalise, and collect the places the bulk pass could not finish
+      type Staged = { job: any; sections: Normalized; noLocationReason: string };
+      const staged: Staged[] = [];
+      const needPlace: { id: string; job: any; current: any }[] = [];
       const missing: string[] = [];
       for (const job of jobs) {
         const raw = byId.get(String(job.id));
@@ -934,38 +1015,52 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         // counts as "United States" instead of sending the job back to reasoning.
         sections.location = sections.location ? cleanLocationAnswer(sections.location) : sections.location;
 
-        // Hybrid reasoning: the bulk call runs with thinking off, so only the
-        // locations it could not finish get a second, thinking-on call.
-        let noLocationReason = "no_location";
+        const item: Staged = { job, sections, noLocationReason: "no_location" };
+        staged.push(item);
         if (LOCATION_REASONING && locationNeedsReasoning(sections.location)) {
-          const verdict = await reasonLocation(keyIdx, apiKey, job, sections.location, getJobContent(job));
-          state.loc_reasoned++;
-          const bulk = sections.location;
-          if (verdict.kind === "resolved") {
-            sections.location = verdict.location;
-            state.loc_resolved++;
-          } else if (verdict.kind === "none") {
-            // the posting itself names no place: a truthful drop
-            sections.location = null;
-            state.loc_none++;
-          } else {
+          needPlace.push({ id: String(job.id), job, current: sections.location });
+        }
+      }
+
+      // (b) one call for every unresolved place in this batch, in slices
+      if (needPlace.length) {
+        const verdicts = new Map<string, LocVerdict>();
+        for (let i = 0; i < needPlace.length; i += LOCATION_BATCH) {
+          const slice = needPlace.slice(i, i + LOCATION_BATCH);
+          const got = await reasonLocationsBatch(keyIdx, apiKey, slice);
+          for (const [k, v] of got) verdicts.set(k, v);
+        }
+        state.loc_reasoned += needPlace.length;
+        const byJobId = new Map(staged.map((s) => [String(s.job.id), s]));
+        for (const item of needPlace) {
+          const v = verdicts.get(item.id) ?? ({ kind: "unavailable", why: "missing" } as LocVerdict);
+          const s = byJobId.get(item.id)!;
+          const bulk = s.sections.location;
+          if (v.kind === "resolved") { s.sections.location = v.location; state.loc_resolved++; }
+          else if (v.kind === "none") { s.sections.location = null; state.loc_none++; } // honest drop
+          else {
             // we looked and never got a usable answer. Keep whatever the bulk pass
             // said; if it said nothing, this job is unknown, not location-less.
-            sections.location = bulk;
-            if (verdict.kind === "unusable") state.loc_unusable++;
+            s.sections.location = bulk;
+            if (v.kind === "unusable") state.loc_unusable++;
             else state.loc_unavailable++;
-            if (!bulk) noLocationReason = "loc_unresolved";
+            if (!bulk) s.noLocationReason = "loc_unresolved";
           }
         }
+      }
+
+      // (c) write
+      let done = 0, dropped = 0, stale = 0, unresolved = 0;
+      for (const item of staged) {
         try {
-          const outcome = await writeOne(job, sections, noLocationReason);
+          const outcome = await writeOne(item.job, item.sections, item.noLocationReason);
           if (outcome === "done") done++;
           else if (outcome === "dropped") dropped++;
           else if (outcome === "stale") stale++;
           else if (outcome === "unresolved") unresolved++;
         } catch (e) {
-          console.error(`[${tag}] write error for ${job.id}: ${String(e).slice(0, 200)}`);
-          missing.push(job.id);
+          console.error(`[${tag}] write error for ${item.job.id}: ${String(e).slice(0, 200)}`);
+          missing.push(item.job.id);
         }
       }
       const missingSet = new Set(missing);
@@ -978,7 +1073,8 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
       state.jobs_dropped += dropped;
       state.jobs_stale += stale;
       state.jobs_unresolved += unresolved;
-      console.log(`[${tag}] of ${jobs.length}: done=${done} no_location=${dropped} unresolved=${unresolved} stale=${stale} released=${missing.length}, ${tokens} tokens`);
+      const locCalls = needPlace.length ? Math.ceil(needPlace.length / LOCATION_BATCH) : 0;
+      console.log(`[${tag}] of ${jobs.length}: done=${done} no_location=${dropped} unresolved=${unresolved} stale=${stale} released=${missing.length}, loc asked=${needPlace.length} calls=${locCalls}, ${tokens} tokens`);
     } catch (e) {
       console.error(`[${tag}] lane error: ${String(e).slice(0, 300)}`);
       await sleep(5000);
