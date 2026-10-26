@@ -277,7 +277,9 @@ function extractSalaryFromCompensation(compensationText: string) {
   const text = compensationText || "";
   const CUR = "GH₵|KSh|US\\$|C\\$|\\$|USD|CAD|EUR|GBP|NGN|GHS|KES|ZAR|₦|₵|£|€|R";
   const re = new RegExp(
-    `(${CUR})?\\s?(\\d{2,3}(?:,\\d{3})?|\\d+)\\s?([kKmM]?)\\s?(?:-|–|to)\\s?(${CUR})?\\s?(\\d{2,3}(?:,\\d{3})?|\\d+)\\s?([kKmM]?)`,
+    // decimals matter: "$110,000.00 - $150,000.00" and "$54.5K - $68K" both used to
+    // parse as 0 / 5,000 because the old pattern stopped at the dot and backtracked.
+    `(${CUR})?\\s?(\\d[\\d,]*(?:\\.\\d+)?)\\s?([kKmM]?)\\s?(?:-|–|to)\\s?(${CUR})?\\s?(\\d[\\d,]*(?:\\.\\d+)?)\\s?([kKmM]?)`,
     "i",
   );
   const m = text.match(re);
@@ -297,7 +299,8 @@ function extractSalaryFromCompensation(compensationText: string) {
     const suf = (suffix || "").toLowerCase();
     if (suf.includes("k") || (sharedSuffix && suffixMin?.toLowerCase().includes("k"))) n *= 1000;
     if (suf.includes("m") || (sharedSuffix && suffixMin?.toLowerCase().includes("m"))) n *= 1000000;
-    return isNaN(n) ? null : n;
+    // a 0 here is always a parse artefact, never a real salary
+    return !Number.isFinite(n) || n <= 0 ? null : Math.round(n);
   };
   return { min: parseAmt(rawMin, suffixMin), max: parseAmt(rawMax, suffixMax), currency };
 }
@@ -508,7 +511,10 @@ async function writeOne(job: any, sections: Normalized): Promise<string> {
   const { workplace_type: workplace, employment_type: employment, location } = sections;
   const postedAt = sections.posted_at ?? scrapedPostedIso(job.posted_at);
 
-  // No location = the job is thrown away. Nothing else makes a job get thrown away except a stale date.
+  // No location = the job is not shown to anyone, so it is not kept. The row
+  // stays in jobs_pending as status=failed / last_error=no_location, which means
+  // a posting can still be revived later with one UPDATE if a location source is
+  // ever added. Nothing else makes a job get thrown away except a stale date.
   if (!location) {
     const { error } = await supabase.from("jobs_pending")
       .update({ status: "failed", last_error: "no_location" }).eq("id", job.id);
