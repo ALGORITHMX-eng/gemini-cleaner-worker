@@ -32,6 +32,9 @@ const GEMINI_URL = USE === "nvidia"
   : "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 const KEY_PREFIX = USE === "nvidia" ? "NVIDIA_API_KEY" : USE === "openrouter" ? "OPENROUTER_API_KEY" : "GEMINI_API_KEY";
 const BATCH = Number(Deno.env.get("BATCH") ?? 60);
+// The stale pre-check throws most of a claim away before the model sees it, so
+// claiming only BATCH leaves 1-2 jobs per paid call. Claim more, keep BATCH.
+const CLAIM_FACTOR = Math.max(1, Number(Deno.env.get("CLAIM_FACTOR") ?? 3));
 const MIN_PENDING = Number(Deno.env.get("MIN_PENDING") ?? 20); // don't waste a call on tiny batches
 const DAILY_CAP = Number(Deno.env.get("DAILY_CAP") ?? (USE === "nvidia" ? 5000 : 1500));   // requests per key per day
 const LANES_PER_KEY = Number(Deno.env.get("LANES_PER_KEY") ?? 10);
@@ -101,6 +104,8 @@ const state = {
   loc_unavailable: 0,
   loc_unusable: 0,
   loc_skipped_cap: 0,
+  loc_circuit: 0,
+  global_unverified: 0,
   last_gemini_ms: 0,
   freshness_last_run: null as string | null,
 };
@@ -361,7 +366,8 @@ function fitBatch(jobs: any[]): { keep: any[]; extra: any[] } {
   let total = 0;
   for (const j of jobs) {
     const n = Math.min(getJobContent(j).length, MAX_CHARS) + 300;
-    if (keep.length && total + n > MAX_BATCH_CHARS) extra.push(j);
+    if (keep.length >= BATCH) extra.push(j); // count cap: the claim is deliberately oversized
+    else if (keep.length && total + n > MAX_BATCH_CHARS) extra.push(j);
     else { keep.push(j); total += n; }
   }
   return { keep, extra };
@@ -467,7 +473,7 @@ async function dropCall(id: any) {
 }
 
 async function claimBatch(): Promise<any[]> {
-  const { data, error } = await supabase.rpc("claim_jobs", { p_limit: BATCH });
+  const { data, error } = await supabase.rpc("claim_jobs", { p_limit: BATCH * CLAIM_FACTOR });
   if (error) throw new Error(error.message);
   const jobs = data ?? [];
   if (jobs.length) {
@@ -593,7 +599,9 @@ async function writeOne(job: any, sections: Normalized, noLocationReason = "no_l
     eligible_cities: job.eligible_cities ?? null,
     employment_type: employment,
     regions: job.regions ?? null,
-    is_global: location.toLowerCase() === GLOBAL_LABEL.toLowerCase() ? true : (job.is_global ?? null),
+    // Never derived from the string alone: a "Worldwide" that survived the check
+    // above is evidence-backed, and anything else is not global.
+    is_global: isGlobalClaim(location),
     requires_us_citizenship: job.requires_us_citizenship ?? null,
     role_description: sections.role_description,
     requirements: sections.requirements,
@@ -662,7 +670,10 @@ const LOCATION_REASON_TOKENS = Number(Deno.env.get("LOCATION_REASON_TOKENS") ?? 
 // to return a single field.
 const LOCATION_BATCH = Number(Deno.env.get("LOCATION_BATCH") ?? 15);
 const LOCATION_ITEM_CHARS = Number(Deno.env.get("LOCATION_REASON_CHARS") ?? 900);
-const LOCATION_REASON_TIMEOUT_MS = Number(Deno.env.get("LOCATION_REASON_TIMEOUT_MS") ?? 180_000);
+// This endpoint answers the BULK call in 25-165s on the same key, so a place call
+// needs real headroom: the prompt is tiny but the wall clock is queue + decode.
+// 180s sat just above the slowest bulk completion and timed out under load.
+const LOCATION_REASON_TIMEOUT_MS = Number(Deno.env.get("LOCATION_REASON_TIMEOUT_MS") ?? 300_000);
 // Thinking on nvidia means chat_template_kwargs.enable_thinking, which
 // nemotron-3.5-lightning answers with HTTP 500. Off unless explicitly enabled.
 const LOCATION_REASON_THINKING = (Deno.env.get("LOCATION_REASON_THINKING") ?? "off").toLowerCase() === "on";
@@ -725,6 +736,43 @@ function cleanLocationAnswer(value: unknown): string {
     )
     .filter(Boolean)
     .join(" | ");
+}
+
+// "Worldwide" is a claim, and a claim has to be paid for by the posting text.
+// The shared-taxonomy detectGlobal() cannot do this check here: it assumes the
+// location field came from the feed, so feeding it the model's own "Worldwide"
+// matches itself and always says yes. These are the body-evidence rules from that
+// same file, applied to content only.
+const GLOBAL_EVIDENCE = [
+  /\b(?:fully\s+)?(?:remote\s*[-–—,(]?\s*)?(?:world\s?wide|globally?|global)\b/,
+  /\bwork\s+from\s+anywhere\b/, /\bremote\s*\(\s*(?:anywhere|global|worldwide)\s*\)/,
+  /\banywhere\s+in\s+the\s+world\b/, /\bany\s+(?:country|location|time\s*zone)\b/,
+  /\blocation\s*:?\s*(?:anywhere|global|worldwide|remote\s*-\s*global)\b/,
+  /\bno\s+location\s+restriction/, /\bfully\s+distributed\b/, /\bopen\s+to\s+all\s+locations\b/,
+];
+const GLOBAL_NEGATION = [
+  /\bglobal\s+(?:team|company|leader|brand|reach|presence|impact|player|organi[sz]ation|scale|network|client|customer|footprint|business|mission|headquarters)\b/,
+  /\bglobally\s+(?:distributed\s+team|recogni[sz]ed|renowned)\b/,
+];
+const GLOBAL_CLAIM_RE = /^(?:worldwide|anywhere|global|remote\s*[-–—]\s*(?:global|worldwide|anywhere))$/i;
+const GLOBAL_RESTRICTION_RE = /\b(must be (?:based|located|residing|authorized|eligible)|only (?:open to|available to|consider)|eligible to work in|work authori[sz]ation|right to work in|authorized to work|(?:US|USA|UK|EU|EMEA|APAC|CANADA)[- ]?(?:based|only|residents|citizens)|within the (?:US|UK|EU))\b/i;
+
+function isGlobalClaim(location: unknown): boolean {
+  return GLOBAL_CLAIM_RE.test(String(location ?? "").trim());
+}
+
+/**
+ * A "Worldwide" answer is only kept when the posting itself says so — an explicit
+ * anywhere/worldwide phrase, or no restriction language at all. Bare "Remote" is
+ * not global: most of those are US-only, which is exactly what the shared taxonomy
+ * has warned about all along.
+ */
+function globalClaimSupported(location: unknown, content: string): boolean {
+  if (!isGlobalClaim(location)) return true; // not a global claim: nothing to verify
+  const body = String(content || "").toLowerCase().slice(0, 1500);
+  if (GLOBAL_NEGATION.some((r) => r.test(body))) return false;
+  if (GLOBAL_RESTRICTION_RE.test(body)) return false;
+  return GLOBAL_EVIDENCE.some((r) => r.test(body));
 }
 
 const BARE_OFFICE_RE = /^(HQ|Headquarters|Head Office|Office|Campus|Site|Plant|Factory|Multiple|Various)$/i;
@@ -793,6 +841,19 @@ function locationLines(content: string): string {
  * skipped comes back as "unavailable", never as a guess.
  * Never throws — a failed batch must not cost the jobs.
  */
+// The place call is the one that keeps answering HTTP 500 from the provider while
+// the identical bulk call succeeds. Retry it once whatever the thinking flag says,
+// and if it keeps failing, stop paying for failures for a while.
+let locFailStreak = 0;
+let locPausedUntil = 0;
+const LOC_FAIL_LIMIT = Math.max(1, Number(Deno.env.get("LOCATION_FAIL_LIMIT") ?? 5));
+const LOC_PAUSE_MS = Number(Deno.env.get("LOCATION_PAUSE_MS") ?? 600_000);
+// 15 lanes each firing a place call plus a retry is a lot of simultaneous small
+// requests, and the provider answers 500 rather than 429 when it is unhappy.
+// Keep the place pass to a few in flight; it is not on the critical path.
+let locInflight = 0;
+const LOC_MAX_CONCURRENT = Math.max(1, Number(Deno.env.get("LOCATION_MAX_CONCURRENT") ?? 3));
+
 async function reasonLocationsBatch(
   keyIdx: number,
   apiKey: string,
@@ -800,6 +861,11 @@ async function reasonLocationsBatch(
 ): Promise<Map<string, LocVerdict>> {
   const out = new Map<string, LocVerdict>();
   if (!items.length) return out;
+  if (locPausedUntil > Date.now()) {
+    state.loc_circuit += items.length;
+    for (const it of items) out.set(String(it.id), { kind: "unavailable", why: "circuit_open" });
+    return out;
+  }
 
   const blocks = items.map((it) => {
     const content = getJobContent(it.job);
@@ -840,35 +906,58 @@ async function reasonLocationsBatch(
   ].join("\n");
 
   const attempt = async (thinking: boolean) => {
-    const slotId = await reserveCall(keyIdx);
-    if (slotId == null) { state.loc_skipped_cap++; throw new Error("cap"); }
+    while (locInflight >= LOC_MAX_CONCURRENT) await sleep(250);
+    locInflight++;
     try {
-      const json = await callGemini(apiKey, [{ role: "user", content: prompt }], {
-        maxTokens: Math.min(LOCATION_REASON_TOKENS, Math.max(1200, 140 * items.length)),
-        thinking,
-        model: LOCATION_REASON_MODEL || undefined,
-        timeoutMs: LOCATION_REASON_TIMEOUT_MS,
-      });
-      const tokens = (json?.usage?.prompt_tokens || 0) + (json?.usage?.completion_tokens || 0);
-      await settleCall(slotId, tokens, true);
-      return json;
-    } catch (e) {
-      await dropCall(slotId);
-      throw e;
+      const slotId = await reserveCall(keyIdx);
+      if (slotId == null) { state.loc_skipped_cap++; throw new Error("cap"); }
+      try {
+        const json = await callGemini(apiKey, [{ role: "user", content: prompt }], {
+          // 1,200 was too tight: the provider answers HTTP 500 instead of a
+          // truncated finish when generation does not complete inside the budget.
+          maxTokens: Math.min(LOCATION_REASON_TOKENS, Math.max(2500, 140 * items.length)),
+          thinking,
+          model: LOCATION_REASON_MODEL || undefined,
+          timeoutMs: LOCATION_REASON_TIMEOUT_MS,
+        });
+        const tokens = (json?.usage?.prompt_tokens || 0) + (json?.usage?.completion_tokens || 0);
+        await settleCall(slotId, tokens, true);
+        return json;
+      } catch (e) {
+        await dropCall(slotId);
+        throw e;
+      }
+    } finally {
+      locInflight--; // always release the slot, success or failure
     }
   };
 
+  // One retry, always — flat, after a short pause. A 500 from the provider is
+  // usually transient; the old code only retried when thinking was enabled.
+  const plans = LOCATION_REASON_THINKING ? [true, false] : [false, false];
   let json: any = null;
-  try {
-    json = await attempt(LOCATION_REASON_THINKING);
-  } catch (e) {
-    // thinking is the usual suspect on nvidia (HTTP 500) — one retry without it
-    if (LOCATION_REASON_THINKING && !/cap$/.test(String(e))) {
-      console.warn(`[loc-reason] ${items.length} jobs failed with thinking on, retrying flat: ${String(e).slice(0, 120)}`);
-      try { json = await attempt(false); } catch (e2) { console.warn(`[loc-reason] batch failed: ${String(e2).slice(0, 140)}`); }
-    } else {
-      console.warn(`[loc-reason] batch failed: ${String(e).slice(0, 140)}`);
+  let lastErr: unknown = null;
+  for (const think of plans) {
+    try {
+      json = await attempt(think);
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      if (/cap$/.test(String(e))) break; // out of budget: retrying cannot help
+      await sleep(1500);
     }
+  }
+  if (!json) {
+    locFailStreak++;
+    console.warn(`[loc-reason] batch failed (${locFailStreak}/${LOC_FAIL_LIMIT}): ${String(lastErr).slice(0, 160)}`);
+    if (locFailStreak >= LOC_FAIL_LIMIT) {
+      locPausedUntil = Date.now() + LOC_PAUSE_MS;
+      locFailStreak = 0;
+      console.error(`[loc-reason] place pass paused for ${Math.round(LOC_PAUSE_MS / 60000)}min after ${LOC_FAIL_LIMIT} failures in a row`);
+    }
+  } else {
+    locFailStreak = 0;
   }
   if (!json) {
     for (const it of items) out.set(String(it.id), { kind: "unavailable", why: "batch_failed" });
@@ -1080,6 +1169,14 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         // counts as "United States" instead of sending the job back to reasoning.
         sections.location = sections.location ? cleanLocationAnswer(sections.location) : sections.location;
 
+        // An unsupported "Worldwide" is not a location, it is a guess. Null it here
+        // so the place pass gets a chance to find a real country; if it cannot, the
+        // job is marked loc_unresolved rather than published as open to everyone.
+        if (sections.location && !globalClaimSupported(sections.location, getJobContent(job))) {
+          state.global_unverified++;
+          sections.location = null;
+        }
+
         // A date we read off the board beats the model's reading of the same date:
         // the regex cannot invent a month, so it stops a fresh posting being killed
         // as stale on a bad guess as well as making the stored posted_at exact.
@@ -1282,7 +1379,7 @@ setInterval(() => {
 // heartbeat so you always see it alive in the Render logs
 setInterval(async () => {
   const pending = await pendingCount();
-  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} no_location=${state.jobs_dropped} unresolved=${state.jobs_unresolved} stale=${state.jobs_stale} stale_pre=${state.stale_precheck} loc[asked=${state.loc_reasoned} resolved=${state.loc_resolved} none=${state.loc_none} unusable=${state.loc_unusable} unavailable=${state.loc_unavailable} cap=${state.loc_skipped_cap}] lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
+  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} no_location=${state.jobs_dropped} unresolved=${state.jobs_unresolved} stale=${state.jobs_stale} stale_pre=${state.stale_precheck} loc[asked=${state.loc_reasoned} resolved=${state.loc_resolved} none=${state.loc_none} unusable=${state.loc_unusable} unavailable=${state.loc_unavailable} cap=${state.loc_skipped_cap} circuit=${state.loc_circuit}] lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
 }, 30_000);
 
 console.log(`[init] worker up: ${state.lanes_total} lanes`);
