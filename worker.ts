@@ -546,6 +546,15 @@ async function writeOne(job: any, sections: Normalized, noLocationReason = "no_l
   const content = getJobContent(job);
   // the model's answers, stored exactly as given (null = the posting does not say)
   const { workplace_type: workplace, employment_type: employment, location } = sections;
+
+  // Who is allowed to apply is a fact the publisher states in its own fields, and
+  // the fields outrank the model's word. Where they name a country, a "Worldwide"
+  // answer is replaced by that country; only an explicit open-world field, or a
+  // total silence, leaves the model's answer standing.
+  const scope = remoteScopeOf(content);
+  const modelGlobal = isGlobalClaim(location);
+  const shownLocation = scope.kind === "country" && modelGlobal ? scope.country ?? null : location;
+  const isGlobal = scope.kind === "worldwide" || (scope.kind === "unknown" && modelGlobal);
   const postedAt = sections.posted_at ?? scrapedPostedIso(job.posted_at);
 
   // No location = the job is not shown to anyone, so it is not kept. The row
@@ -554,7 +563,7 @@ async function writeOne(job: any, sections: Normalized, noLocationReason = "no_l
   //   loc_unresolved  we never learned where it is (cap, timeout, junk answer)
   // The second is not a verdict, so it stays queryable and is safe to requeue
   // once there is budget. Nothing else throws a job away except a stale date.
-  if (!location) {
+  if (!shownLocation) {
     const { error } = await supabase.from("jobs_pending")
       .update({ status: "failed", last_error: noLocationReason }).eq("id", job.id);
     if (error) throw new Error(`${noLocationReason} update failed: ${error.message}`);
@@ -592,16 +601,17 @@ async function writeOne(job: any, sections: Normalized, noLocationReason = "no_l
     dedup_hash: job.dedup_hash,
     company: job.company || "Unknown",
     role: decodeEntities(job.title),
-    location,
+    location: shownLocation,
     job_type: workplace,
     workplace_type: workplace,
     eligible_countries: job.eligible_countries ?? null,
     eligible_cities: job.eligible_cities ?? null,
     employment_type: employment,
     regions: job.regions ?? null,
-    // Never derived from the string alone: a "Worldwide" that survived the check
-    // above is evidence-backed, and anything else is not global.
-    is_global: isGlobalClaim(location),
+    // Decided by the publisher's own fields (see remoteScopeOf), not by the word
+    // the model chose: an explicit open-world field means global; a field naming a
+    // country means country, whatever the model said; silence leaves it to the model.
+    is_global: isGlobal,
     requires_us_citizenship: job.requires_us_citizenship ?? null,
     role_description: sections.role_description,
     requirements: sections.requirements,
@@ -738,45 +748,82 @@ function cleanLocationAnswer(value: unknown): string {
     .join(" | ");
 }
 
-// "Worldwide" is a claim, and a claim has to be paid for by the posting text.
-// The shared-taxonomy detectGlobal() cannot do this check here: it assumes the
-// location field came from the feed, so feeding it the model's own "Worldwide"
-// matches itself and always says yes. These are the body-evidence rules from that
-// same file, applied to content only.
-const GLOBAL_EVIDENCE = [
-  /\b(?:fully\s+)?(?:remote\s*[-–—,(]?\s*)?(?:world\s?wide|globally?|global)\b/,
-  /\bwork\s+from\s+anywhere\b/, /\bremote\s*\(\s*(?:anywhere|global|worldwide)\s*\)/,
-  /\banywhere\s+in\s+the\s+world\b/, /\bany\s+(?:country|location|time\s*zone)\b/,
-  /\blocation\s*:?\s*(?:anywhere|global|worldwide|remote\s*-\s*global)\b/,
-  /\bno\s+location\s+restriction/, /\bfully\s+distributed\b/, /\bopen\s+to\s+all\s+locations\b/,
-];
-const GLOBAL_NEGATION = [
-  /\bglobal\s+(?:team|company|leader|brand|reach|presence|impact|player|organi[sz]ation|scale|network|client|customer|footprint|business|mission|headquarters)\b/,
-  /\bglobally\s+(?:distributed\s+team|recogni[sz]ed|renowned)\b/,
-];
-const GLOBAL_CLAIM_RE = /^(?:worldwide|anywhere|global|remote\s*[-–—]\s*(?:global|worldwide|anywhere))$/i;
-const GLOBAL_RESTRICTION_RE = /\b(must be (?:based|located|residing|authorized|eligible)|only (?:open to|available to|consider)|eligible to work in|work authori[sz]ation|right to work in|authorized to work|(?:US|USA|UK|EU|EMEA|APAC|CANADA)[- ]?(?:based|only|residents|citizens)|within the (?:US|UK|EU))\b/i;
+// ------------------------------------------------------- who may apply, per the publisher
+// Hiring scope is not an inference, it is a field. Google's JobPosting spec makes a
+// publisher say either "telecommute, open to these countries" or nothing at all, and
+// the ATS list APIs carry the same thing as a place string. So the question "is this
+// worldwide?" is answered by what the posting declares, in this order:
+//
+//   1. "Applicant countries:" — schema.org applicantLocationRequirements, when the
+//      page publishes it. Explicit list => that list. Explicit open world => worldwide.
+//   2. any header field naming a country => that country, "Remote" notwithstanding.
+//      This is the case that was being missed: "US - Remote (Any Location)" is ATS
+//      jargon for any US office, not for anywhere on earth.
+//   3. an explicit open-world phrase => worldwide.
+//   4. otherwise unstated. "Remote" or "Any Location" alone is not evidence of
+//      anything, and it is not treated as global.
+//
+// Nothing here reads the body prose: only the labelled header lines that the fetchers
+// build. The model still chooses the location text; these fields decide is_global.
+type RemoteScope = { kind: "worldwide" | "country" | "unknown"; country?: string };
 
+const SCOPE_LINE_RE = /^\s*(location|all locations|office|country|workplace type|job location type|applicant countries?|applicant location requirements?)\s*[:\-–]\s*(.+)$/gim;
+const SHORT_COUNTRY_RE = /(?:^|[\s,|(/-])(usa|u\.s\.a?|us|uk|uae|north america|emea|apac|latam)(?=$|[\s,|)/-])/i;
+const OPEN_WORLD_RE = /\b(worldwide|world wide|any country|any countries|anywhere in the world|all countries|global remote|remote\s*[-–]\s*global)\b/i;
+
+// "USA", "US" and "United States of America" are one country, not three.
+function canonicalCountry(raw: string): string {
+  const v = raw.trim();
+  if (/^(usa|u\.s\.?a?\.?|us|united states.*)$/i.test(v)) return "United States";
+  if (/^(uk|u\.k\.?|united kingdom|england|scotland|wales)$/i.test(v)) return "United Kingdom";
+  if (/^(uae|united arab emirates)$/i.test(v)) return "United Arab Emirates";
+  return v.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function countriesIn(text: string): string[] {
+  const out: string[] = [];
+  const push = (raw: string) => {
+    if (/^worldwide$/i.test(raw)) return;
+    const v = canonicalCountry(raw);
+    if (!out.some((c) => c.toLowerCase() === v.toLowerCase())) out.push(v);
+  };
+  for (const m of text.matchAll(new RegExp(COUNTRY_RE.source, "gi"))) push(m[0]);
+  for (const m of text.matchAll(new RegExp(SHORT_COUNTRY_RE.source, "gi"))) push(m[1]);
+  return out;
+}
+
+function remoteScopeOf(content: string): RemoteScope {
+  const head = String(content || "").slice(0, 1500);
+  const lines = [...head.matchAll(SCOPE_LINE_RE)].map((m) => `${m[1].toLowerCase()}: ${m[2].trim()}`);
+  if (!lines.length) return { kind: "unknown" };
+  const header = lines.join("\n");
+
+  const applicant = /applicant (?:countries?|location requirements?)\s*:\s*(.+)/i.exec(header)?.[1] ?? "";
+  if (applicant) {
+    if (OPEN_WORLD_RE.test(applicant)) return { kind: "worldwide" };
+    const list = countriesIn(applicant);
+    // Several countries is not one place: no single value can be shown honestly.
+    return list.length === 1 ? { kind: "country", country: list[0] } : { kind: "country" };
+  }
+
+  // A bare "TELECOMMUTE" is deliberately NOT read as worldwide: publishers omit
+  // applicantLocationRequirements even when the role is US-only, so absence there
+  // proves nothing. Only an explicit open-world phrase does.
+  const named = countriesIn(header);
+  if (named.length === 1) return { kind: "country", country: named[0] };
+  if (named.length > 1) return { kind: "country" };
+
+  if (OPEN_WORLD_RE.test(header)) return { kind: "worldwide" };
+
+  return { kind: "unknown" };
+}
+const GLOBAL_CLAIM_RE = /^(?:worldwide|anywhere|global|remote\s*[-–—]\s*(?:global|worldwide|anywhere))$/i;
+
+// Not a validator: it only labels the model's own answer so the row can carry
+// is_global = true. The model decided the word; this reads that word back.
 function isGlobalClaim(location: unknown): boolean {
   return GLOBAL_CLAIM_RE.test(String(location ?? "").trim());
 }
-
-/**
- * A "Worldwide" answer is only kept when the posting itself says so — an explicit
- * anywhere/worldwide phrase, or no restriction language at all. Bare "Remote" is
- * not global: most of those are US-only, which is exactly what the shared taxonomy
- * has warned about all along.
- */
-function globalClaimSupported(location: unknown, content: string): boolean {
-  if (!isGlobalClaim(location)) return true; // not a global claim: nothing to verify
-  const body = String(content || "").toLowerCase().slice(0, 1500);
-  if (GLOBAL_NEGATION.some((r) => r.test(body))) return false;
-  if (GLOBAL_RESTRICTION_RE.test(body)) return false;
-  return GLOBAL_EVIDENCE.some((r) => r.test(body));
-}
-
-const BARE_OFFICE_RE = /^(HQ|Headquarters|Head Office|Office|Campus|Site|Plant|Factory|Multiple|Various)$/i;
-const BARE_PLACEHOLDER_RE = /^(all states|all locations|multiple locations|various locations|nationwide|anywhere)$/i;
 
 /**
  * Is this a place the product can actually show? Not a gazetteer and not a
@@ -786,17 +833,6 @@ const BARE_PLACEHOLDER_RE = /^(all states|all locations|multiple locations|vario
  * and it was rejecting correct answers like "Tehran, Iran".
  * "Belgium" passes. "Bangalore HQ", "Headquarters" and "Location - All States" do not.
  */
-function isUsableLocation(value: unknown): boolean {
-  const segs = cleanLocationAnswer(value).split("|").map((s) => s.trim()).filter(Boolean);
-  if (!segs.length) return false;
-  return segs.every((seg) => {
-    if (BARE_OFFICE_RE.test(seg)) return false;
-    if (BARE_PLACEHOLDER_RE.test(seg.replace(/^location\s*[-–:]\s*/i, ""))) return false;
-    if (OFFICE_WORD_RE.test(seg) && seg.split(",").length < 2) return false;
-    return true;
-  });
-}
-
 /** True when the answer still is not a usable "place, country". */
 function locationNeedsReasoning(loc: unknown): boolean {
   const s = cleanLocationAnswer(loc).trim();
@@ -981,7 +1017,6 @@ async function reasonLocationsBatch(
     if (typeof hit.location !== "string") { out.set(String(it.id), { kind: "unavailable", why: "not_a_string" }); continue; }
     const clean = cleanLocationAnswer(hit.location);
     if (!clean) { out.set(String(it.id), { kind: "none" }); continue; }
-    if (!isUsableLocation(clean)) { out.set(String(it.id), { kind: "unusable", answer: clean }); continue; }
     out.set(String(it.id), { kind: "resolved", location: clean });
   }
   return out;
@@ -1169,13 +1204,8 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
         // counts as "United States" instead of sending the job back to reasoning.
         sections.location = sections.location ? cleanLocationAnswer(sections.location) : sections.location;
 
-        // An unsupported "Worldwide" is not a location, it is a guess. Null it here
-        // so the place pass gets a chance to find a real country; if it cannot, the
-        // job is marked loc_unresolved rather than published as open to everyone.
-        if (sections.location && !globalClaimSupported(sections.location, getJobContent(job))) {
-          state.global_unverified++;
-          sections.location = null;
-        }
+        // The model owns the location decision — nothing here second-guesses a
+        // "Worldwide" answer. The prompt carries the rule instead (line ~137).
 
         // A date we read off the board beats the model's reading of the same date:
         // the regex cannot invent a month, so it stops a fresh posting being killed
