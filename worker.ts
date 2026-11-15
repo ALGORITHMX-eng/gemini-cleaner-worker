@@ -21,7 +21,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // Prefer OpenRouter 120B. Set LLM=nvidia only if you have NVIDIA integrate access to a 120B id.
 const USE = (Deno.env.get("LLM") ?? "nvidia").toLowerCase(); // "nvidia" | "openrouter" | "gemini"
 const MODEL = USE === "nvidia"
-  ? (Deno.env.get("NVIDIA_MODEL") ?? "nvidia/nemotron-3-super-120b-a12b")
+  ? (Deno.env.get("NVIDIA_MODEL") ?? "nvidia/nemotron-3.5-super-vl-120b-a12b")
   : USE === "openrouter"
   ? (Deno.env.get("OPENROUTER_MODEL") ?? "nvidia/nemotron-3-super-120b-a12b:free")
   : (Deno.env.get("GEMINI_CLEAN_MODEL") ?? "gemini-3.8-flash");
@@ -137,6 +137,8 @@ Also read the fields below from the WHOLE posting. Your answer is FINAL: it is s
 - "location_evidence": the exact short phrase(s) (copied word-for-word) from the "Location", "All locations", "Office" or "Country" label lines, the title, the description or the job URL that state where the candidate must be based, or that the job is open worldwide. If the place comes from an office name in the text or from a place written into the URL, quote that. null if nothing points to a place. Fill this BEFORE location.
 - "location": where the candidate must be based, or null. Start from whatever the posting states, then RESOLVE it when you can. If you recognise the city/town/state/office, add the country: "Dresden" -> "Dresden, Germany"; "Bangalore HQ" -> "Bangalore, India"; "Austin, TX" -> "Austin, TX, United States"; "Palo Alto" -> "Palo Alto, California, United States". If you are NOT sure of the country, keep the place exactly as written in the posting — do NOT invent a country, and do NOT drop a real city just because the country is unknown (e.g. leave "Lagos" as "Lagos", "Remote - Nairobi" as "Nairobi"). If the posting gives only a country, keep that country; do not invent a city. Prefer "City, Country" or "City, State, Country" when you know both. When several DISTINCT places are listed, keep all of them, separated by " | " — that is a multi-site job, NOT global. Write "${GLOBAL_LABEL}" ONLY when the posting EXPLICITLY says the role is open worldwide / any country / anywhere in the world / all countries. Listing several offices, several countries, EMEA, APAC, LATAM, or "North America" is NOT worldwide. A global company is NOT worldwide. "Remote" with no city or country is null location, not Worldwide. A mere preference such as "ideally in a US time zone" is NOT a location. Do NOT include the words remote, hybrid or onsite inside location.
 - "posted_date": the date this job was posted as YYYY-MM-DD, from a "Posted:" or "First published:" line or a phrase like "Posted on March 3, 2026". A relative phrase such as "Posted 3 Days Ago" or "30+ Days Ago" counts: work the date out from today's date (for "30+ Days Ago" use 30 days). "Updated" and "Valid through" dates do NOT count. null if the posting gives no posting date.
+- "seniority_evidence": the exact short phrase (under 25 words, copied word-for-word) from the title or description that shows the level of the role: a title word such as "Intern", "Junior", "Senior", "Staff", "Lead", "Principal", "Head of", or a years-of-experience requirement for THIS role. null if there is none. Fill this BEFORE seniority.
+- "seniority": one of "intern", "junior", "mid", "senior", "lead", "unknown". Set it ONLY from seniority_evidence; if seniority_evidence is null this MUST be "unknown". A level word in the title wins over years of experience. intern = Intern, Internship, Trainee, Working Student. junior = Junior, Jr, Entry Level, Graduate, or 0-2 years required. mid = Mid-level, Intermediate, or 3-5 years required. senior = Senior, Sr, or 5+ years required. lead = Lead, Staff, Principal, Head of, Director, Manager, Architect. Do not infer from salary, company size or the tech stack.
 Copy each job's "id" exactly. Do not skip a job. Do not add jobs.
 Respond with ONLY this JSON shape, no markdown:
 {"results":[{"id":"...","role_description":"...","requirements":"...","nice_to_have":"...","qualifications":"...","compensation":"...","benefits":"...","work_setup":"...","about_company":"...","company_culture":"...","extracted_skills":["..."],"workplace_evidence":null,"workplace_type":null,"employment_evidence":null,"employment_type":null,"seniority_evidence":null,"seniority":"unknown","location_evidence":null,"location":null,"posted_date":null}]}`;
@@ -642,7 +644,8 @@ async function writeOne(job: any, sections: Normalized, noLocationReason = "no_l
     about_company: sections.about_company,
     company_culture: sections.company_culture,
     extracted_skills: sections.extracted_skills,
-    posted_at: postedAt,
+        posted_at: postedAt,
+    seniority: sections.seniority,
     salary_min: salary.min,
     salary_max: salary.max,
     salary_currency: salary.currency,
@@ -692,7 +695,7 @@ const GEMINI_REASONING = Deno.env.get("GEMINI_REASONING_EFFORT") ?? "none"; // i
 // A second, thinking-ON call is made only for the jobs whose location came back
 // unresolved — no country at all, an office name, or null. Cheap path for the
 // obvious ones, reasoning for the ones that need it.
-const LOCATION_REASONING = (Deno.env.get("LOCATION_REASONING") ?? "on").toLowerCase() !== "off";
+const LOCATION_REASONING = false;
 const LOCATION_REASON_TOKENS = Number(Deno.env.get("LOCATION_REASON_TOKENS") ?? 3000);
 // Places are resolved for a whole batch in ONE call, the same way the bulk pass
 // works. One call per job was costing ~0.4 calls/job — about 2x the bulk pass —
