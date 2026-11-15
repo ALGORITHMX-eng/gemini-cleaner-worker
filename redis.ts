@@ -1,41 +1,47 @@
-import { Redis } from "https://esm.sh/@upstash/redis@1.31.6";
+const JOB_HASHES_KEY = "job_hashes";
 
-export const redis = new Redis({
-  url: Deno.env.get("UPSTASH_REDIS_REST_URL")!,
-  token: Deno.env.get("UPSTASH_REDIS_REST_TOKEN")!,
-});
+const member = (s: string) =>
+  '"' + s.replace(/[\\"'\s]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")) + '"';
 
-export const JOB_HASHES_KEY = "job_hashes";
-
-/** Returns the subset of `hashes` NOT already present in the Redis set. */
-export async function filterUnseenHashes(hashes: string[]): Promise<string[]> {
-  if (hashes.length === 0) return [];
-  const BATCH = 500;
-  const unseen: string[] = [];
-  for (let i = 0; i < hashes.length; i += BATCH) {
-    const batch = hashes.slice(i, i + BATCH);
-    try {
-      const results = await redis.smismember(JOB_HASHES_KEY, ...batch);
-      batch.forEach((h, idx) => {
-        if (results[idx] === 0) unseen.push(h);
-      });
-    } catch (err) {
-      // Fail-open: on a Redis error, treat the batch as unseen rather than
-      // silently dropping real jobs. Worst case is a harmless duplicate
-      // upsert (dedup_hash conflict handles that at the DB level anyway).
-      console.error(`[redis] smismember batch error, failing open: ${err}`);
-      unseen.push(...batch);
-    }
-  }
-  return unseen;
+async function command(...parts: string[]): Promise<any[]> {
+  const url = Deno.env.get("UPSTASH_REDIS_REST_URL")!;
+  const token = Deno.env.get("UPSTASH_REDIS_REST_TOKEN")!;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query: parts.join(" ") }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`Redis ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const body = await res.json() as { rows?: any[] };
+  if (!Array.isArray(body.rows)) throw new Error("Redis: no rows in reply");
+  return body.rows;
 }
 
-/** Marks hashes as seen. Call ONLY once a job is actually saved to jobs_master. */
+/** Subset of hashes NOT already in the set. Fail-open on error (cleaner should not block writes). */
+export async function filterUnseenHashes(hashes: string[]): Promise<string[]> {
+  if (hashes.length === 0) return [];
+  try {
+    const rows = await command("SMISMEMBER", JOB_HASHES_KEY, ...hashes.map(member));
+    const flags: number[] = new Array(hashes.length).fill(-1);
+    for (const r of rows) flags[Number(r.index)] = Number(r.value);
+    if (flags.includes(-1)) throw new Error("Redis smismember returned an invalid result");
+    return hashes.filter((_, i) => flags[i] === 0);
+  } catch (err) {
+    console.error("[redis] smismember failed open:", err);
+    return hashes;
+  }
+}
+
+/** Mark hashes seen after jobs_master write. Log-only on failure — job is already saved. */
 export async function markHashesSeen(hashes: string[]): Promise<void> {
   if (hashes.length === 0) return;
   try {
-    await redis.sadd(JOB_HASHES_KEY, ...hashes);
+    await command("SADD", JOB_HASHES_KEY, ...hashes.map(member));
   } catch (err) {
-    console.error(`[redis] sadd error: ${err}`);
+    console.error("[redis] sadd error:", err);
   }
 }

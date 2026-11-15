@@ -18,9 +18,10 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const USE = (Deno.env.get("LLM") ?? "gemini").toLowerCase(); // "gemini" | "openrouter" | "nvidia"
+// Prefer OpenRouter 120B. Set LLM=nvidia only if you have NVIDIA integrate access to a 120B id.
+const USE = (Deno.env.get("LLM") ?? "nvidia").toLowerCase(); // "nvidia" | "openrouter" | "gemini"
 const MODEL = USE === "nvidia"
-  ? (Deno.env.get("NVIDIA_MODEL") ?? "nvidia/nemotron-3.5-lightning-30b-a3b")
+  ? (Deno.env.get("NVIDIA_MODEL") ?? "nvidia/nemotron-3-super-120b-a12b")
   : USE === "openrouter"
   ? (Deno.env.get("OPENROUTER_MODEL") ?? "nvidia/nemotron-3-super-120b-a12b:free")
   : (Deno.env.get("GEMINI_CLEAN_MODEL") ?? "gemini-3.8-flash");
@@ -134,11 +135,11 @@ Also read the fields below from the WHOLE posting. Your answer is FINAL: it is s
 - "employment_evidence": the exact short phrase (under 25 words, copied word-for-word) that states the type of employment. A label line such as "Employment type: FullTime" is valid evidence. null if there is none. Fill this BEFORE employment_type.
 - "employment_type": one of "FULL_TIME", "PART_TIME", "CONTRACT", "TEMPORARY", "INTERNSHIP", "VOLUNTEER", or null. Set it ONLY from employment_evidence. Map label values the obvious way: FullTime or Full-time = FULL_TIME, PartTime or Part-time = PART_TIME, Contract, Contractor or Freelance = CONTRACT, Temp or Temporary = TEMPORARY, Intern or Internship = INTERNSHIP. "contract assignment" or "fixed-term contract position" means CONTRACT. "employment contract" or "subject to contract" is NOT evidence. "40 hours per week" about THIS role counts as FULL_TIME. A title containing the whole word "Intern" or "Internship" counts as INTERNSHIP. Do not infer from salary or seniority.
 - "location_evidence": the exact short phrase(s) (copied word-for-word) from the "Location", "All locations", "Office" or "Country" label lines, the title, the description or the job URL that state where the candidate must be based, or that the job is open worldwide. If the place comes from an office name in the text or from a place written into the URL, quote that. null if nothing points to a place. Fill this BEFORE location.
-- "location": where the candidate must be based, or null. Start from whatever the posting states, then RESOLVE it to a usable place. You MUST name the country for a city, town, state or office you recognise: "Dresden" -> "Dresden, Germany"; "Berlin" -> "Berlin, Germany"; "Bangalore HQ" -> "Bangalore, India"; "Chennai Regional Office" -> "Chennai, India"; "Atlanta, Georgia" -> "Atlanta, Georgia, United States"; "Austin, TX" -> "Austin, TX, United States"; "Palo Alto" -> "Palo Alto, California, United States"; "North Kingstown, RI" -> "North Kingstown, Rhode Island, United States". Use everything available for this: the label lines, the description, the company's own office name and the job URL (Workday links often carry the place, e.g. ".../Malaysia--Kuala-Lumpur-SSC/..."). If the posting gives only a country, keep the country and do not invent a city for it. Write "City, Country" or "City, State, Country". Write "${GLOBAL_LABEL}" ONLY when the posting explicitly says anywhere / any country; a global company is NOT worldwide. A mere preference such as "ideally in a US time zone" is NOT a location. null ONLY when nothing in the posting, the office name or the URL points to a place (for example "Remote" with no country anywhere); "Remote" plus a country is just the country. When several places are listed keep all of them, separated by " | ". Write country names as full English names (US/USA = United States, UK = United Kingdom). Do NOT include the words remote, hybrid or onsite.
+- "location": where the candidate must be based, or null. Start from whatever the posting states, then RESOLVE it when you can. If you recognise the city/town/state/office, add the country: "Dresden" -> "Dresden, Germany"; "Bangalore HQ" -> "Bangalore, India"; "Austin, TX" -> "Austin, TX, United States"; "Palo Alto" -> "Palo Alto, California, United States". If you are NOT sure of the country, keep the place exactly as written in the posting — do NOT invent a country, and do NOT drop a real city just because the country is unknown (e.g. leave "Lagos" as "Lagos", "Remote - Nairobi" as "Nairobi"). If the posting gives only a country, keep that country; do not invent a city. Prefer "City, Country" or "City, State, Country" when you know both. When several DISTINCT places are listed, keep all of them, separated by " | " — that is a multi-site job, NOT global. Write "${GLOBAL_LABEL}" ONLY when the posting EXPLICITLY says the role is open worldwide / any country / anywhere in the world / all countries. Listing several offices, several countries, EMEA, APAC, LATAM, or "North America" is NOT worldwide. A global company is NOT worldwide. "Remote" with no city or country is null location, not Worldwide. A mere preference such as "ideally in a US time zone" is NOT a location. Do NOT include the words remote, hybrid or onsite inside location.
 - "posted_date": the date this job was posted as YYYY-MM-DD, from a "Posted:" or "First published:" line or a phrase like "Posted on March 3, 2026". A relative phrase such as "Posted 3 Days Ago" or "30+ Days Ago" counts: work the date out from today's date (for "30+ Days Ago" use 30 days). "Updated" and "Valid through" dates do NOT count. null if the posting gives no posting date.
 Copy each job's "id" exactly. Do not skip a job. Do not add jobs.
 Respond with ONLY this JSON shape, no markdown:
-{"results":[{"id":"...","role_description":"...","requirements":"...","nice_to_have":"...","qualifications":"...","compensation":"...","benefits":"...","work_setup":"...","about_company":"...","company_culture":"...","extracted_skills":["..."],"workplace_evidence":null,"workplace_type":null,"employment_evidence":null,"employment_type":null,"location_evidence":null,"location":null,"posted_date":null}]}`;
+{"results":[{"id":"...","role_description":"...","requirements":"...","nice_to_have":"...","qualifications":"...","compensation":"...","benefits":"...","work_setup":"...","about_company":"...","company_culture":"...","extracted_skills":["..."],"workplace_evidence":null,"workplace_type":null,"employment_evidence":null,"employment_type":null,"seniority_evidence":null,"seniority":"unknown","location_evidence":null,"location":null,"posted_date":null}]}`;
 }
 
 interface SectionResult {
@@ -157,9 +158,11 @@ interface SectionResult {
   workplace_type?: string | null;
   employment_evidence?: string | null;
   employment_type?: string | null;
-  location_evidence?: string | null;
+    location_evidence?: string | null;
   location?: string | null;
   posted_date?: string | null;
+  seniority_evidence?: string | null;
+  seniority?: string | null;
 }
 
 interface Normalized {
@@ -176,8 +179,9 @@ interface Normalized {
   extracted_skills: string[];
   workplace_type: string | null;
   employment_type: string | null;
-  location: string | null;
+    location: string | null;
   posted_at: string | null; // ISO, from the model's posted_date
+  seniority: string; // intern | junior | mid | senior | lead | unknown
 }
 
 function stripHtmlArtifacts(text: string): string {
@@ -209,7 +213,8 @@ function decodeEntities(t: string | null | undefined): string {
 // a value outside the allowed list can't be stored, so it becomes null (left empty).
 const VALID_WORKPLACE = new Set(["REMOTE", "HYBRID", "ONSITE"]);
 const VALID_EMPTYPE = new Set(["FULL_TIME", "PART_TIME", "CONTRACT", "TEMPORARY", "INTERNSHIP", "VOLUNTEER"]);
-const NO_ANSWER = new Set(["", "null", "none", "unknown", "n/a", "na", "not stated", "not specified"]);
+const VALID_SENIORITY = new Set(["intern", "junior", "mid", "senior", "lead", "unknown"]);
+const NO_ANSWER = new Set(["", "null", "none", "n/a", "na", "not stated", "not specified"]);
 
 function enumOrNull(v: unknown, valid: Set<string>): string | null {
   // "On-site", "on site", "full time", "Full-Time" all map to the allowed value; anything else is null
@@ -249,10 +254,14 @@ function normalizeSections(raw: SectionResult): Normalized {
   return {
     role_description, requirements, nice_to_have, qualifications, compensation, benefits,
     work_setup, about_company, company_culture, full_description, extracted_skills,
-    workplace_type: enumOrNull(raw.workplace_type, VALID_WORKPLACE),
+        workplace_type: enumOrNull(raw.workplace_type, VALID_WORKPLACE),
     employment_type: enumOrNull(raw.employment_type, VALID_EMPTYPE),
     location: textOrNull(raw.location, 2000),
     posted_at: isoFromDay(raw.posted_date),
+    seniority: (() => {
+      const s = String(raw.seniority ?? "").toLowerCase().trim();
+      return VALID_SENIORITY.has(s) ? s : "unknown";
+    })(),
   };
 }
 
@@ -549,12 +558,22 @@ async function writeOne(job: any, sections: Normalized, noLocationReason = "no_l
 
   // Who is allowed to apply is a fact the publisher states in its own fields, and
   // the fields outrank the model's word. Where they name a country, a "Worldwide"
-  // answer is replaced by that country; only an explicit open-world field, or a
-  // total silence, leaves the model's answer standing.
-  const scope = remoteScopeOf(content);
+  // answer is replaced by that country. Where they are silent, the answer is no
+  // longer "let the model decide" - silence becomes Remote, never Worldwide.
+    const scope = remoteScopeOf(content);
   const modelGlobal = isGlobalClaim(location);
-  const shownLocation = scope.kind === "country" && modelGlobal ? scope.country ?? null : location;
-  const isGlobal = scope.kind === "worldwide" || (scope.kind === "unknown" && modelGlobal);
+  // Multi-site lists ("Berlin | Paris | London") are NOT global. Only explicit open-world
+  // from the publisher, or model Worldwide when scope is truly unknown, counts.
+  const multiSite = typeof location === "string" && location.includes("|") && !isGlobalClaim(location);
+  const isGlobal =
+    scope.kind === "worldwide" ||
+    (scope.kind === "unknown" && modelGlobal && !multiSite);
+  const shownLocation =
+    scope.kind === "country" && modelGlobal
+      ? scope.country ?? null
+      : modelGlobal && !isGlobal
+        ? (scope.kind === "remote_unknown" ? "Remote" : location)
+        : location;
   const postedAt = sections.posted_at ?? scrapedPostedIso(job.posted_at);
 
   // No location = the job is not shown to anyone, so it is not kept. The row
@@ -765,11 +784,15 @@ function cleanLocationAnswer(value: unknown): string {
 //
 // Nothing here reads the body prose: only the labelled header lines that the fetchers
 // build. The model still chooses the location text; these fields decide is_global.
-type RemoteScope = { kind: "worldwide" | "country" | "unknown"; country?: string };
+type RemoteScope = { kind: "worldwide" | "country" | "remote_unknown" | "unknown"; country?: string };
 
 const SCOPE_LINE_RE = /^\s*(location|all locations|office|country|workplace type|job location type|applicant countries?|applicant location requirements?)\s*[:\-–]\s*(.+)$/gim;
 const SHORT_COUNTRY_RE = /(?:^|[\s,|(/-])(usa|u\.s\.a?|us|uk|uae|north america|emea|apac|latam)(?=$|[\s,|)/-])/i;
-const OPEN_WORLD_RE = /\b(worldwide|world wide|any country|any countries|anywhere in the world|all countries|global remote|remote\s*[-–]\s*global)\b/i;
+// "Remote, Global" and "Global - Remote" both mean open world; the comma form used to
+// slip through and land in remote_unknown, which would have demoted 21 correct rows.
+const OPEN_WORLD_RE = /\b(worldwide|world wide|any country|any countries|anywhere in the world|all countries|global)\b|remote\s*[,\-–]\s*(?:global|worldwide)/i;
+// The publisher stated a place, and the place is "remote" with no country attached.
+const BARE_REMOTE_RE = /\b(remote|work from home|wfh|telecommute|home[- ]?based|fully distributed|distributed team)\b/i;
 
 // "USA", "US" and "United States of America" are one country, not three.
 function canonicalCountry(raw: string): string {
@@ -814,6 +837,12 @@ function remoteScopeOf(content: string): RemoteScope {
   if (named.length > 1) return { kind: "country" };
 
   if (OPEN_WORLD_RE.test(header)) return { kind: "worldwide" };
+
+  // The publisher named a place and the place is just "Remote". No country, no
+  // applicant list, no open-world phrase: the scope is genuinely unstated, so the
+  // model's "Worldwide" is not allowed to stand. Distinct from "unknown", where the
+  // posting carries no location line at all and silence still leaves it to the model.
+  if (BARE_REMOTE_RE.test(header)) return { kind: "remote_unknown" };
 
   return { kind: "unknown" };
 }
