@@ -13,6 +13,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { markHashesSeen } from "./redis.ts";
+import pg from "npm:pg";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -56,6 +57,8 @@ const CF_WORKER_URL = Deno.env.get("CF_WORKER_URL") || "";
 const FRESHNESS_EVERY_MS = 10 * 60 * 1000;
 const FRESHNESS_BATCHES = 3;
 const FRESHNESS_LIMIT = 200;
+const FRESHNESS_DB_URL = Deno.env.get("FRESHNESS_DB_URL") || ""; // Layerbase: where job_freshness lives now
+const FRESHNESS_DRIVER = (Deno.env.get("FRESHNESS_DRIVER") ?? "off").toLowerCase() === "on"; // old driver into the Supabase function
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -109,6 +112,8 @@ const state = {
   global_unverified: 0,
   last_gemini_ms: 0,
   freshness_last_run: null as string | null,
+  fresh_written: 0,
+  fresh_failed: 0,
 };
 
 // ---------------------------------------------------------------- prompt
@@ -552,7 +557,7 @@ async function recoverStuck() {
 }
 
 // ---------------------------------------------------------------- write one job
-// Returns: "done" | "dropped" | "stale" | "deferred". Throws on a db error so the lane can count a strike.
+// Returns: "done" | "dropped" | "stale" | "unresolved". Throws on a db error so the lane can count a strike.
 async function writeOne(job: any, sections: Normalized, noLocationReason = "no_location"): Promise<string> {
   const content = getJobContent(job);
   // the model's answers, stored exactly as given (null = the posting does not say)
@@ -662,17 +667,18 @@ async function writeOne(job: any, sections: Normalized, noLocationReason = "no_l
     // throw (not silently retry forever): the lane counts a strike and the real reason shows in the logs
     throw new Error(`jobs_master upsert failed: ${masterErr.message}`);
   }
-  const { error: freshErr } = await supabase.from(FRESHNESS_TABLE).upsert({
+  // Best effort, off the critical path. The job is already in jobs_master, which is what the
+  // app reads; this row only drives the liveness check later. A failure here must never put
+  // the job back in the queue: claim_jobs has no attempt counter and orders by created_at, so
+  // a requeued row stays the oldest pending row and is re-claimed on every pass, paying for a
+  // whole Gemini call each time. Queue it and flush in bulk instead.
+  queueFresh({
     job_id: job.id,
     job_url: job.job_url,
-    dedup_hash: job.dedup_hash,
-    source: job.source,
+    dedup_hash: job.dedup_hash ?? null,
+    source: job.source ?? null,
     expires_at: expiresIso,
-  }, { onConflict: "job_id" });
-  if (freshErr) {
-    await supabase.from("jobs_pending").update({ status: "pending", last_error: null }).eq("id", job.id);
-    return "deferred";
-  }
+  });
   await supabase.from("jobs_pending").update({ status: "done", last_error: null }).eq("id", job.id);
   if (job.dedup_hash) {
     try { await markHashesSeen([job.dedup_hash]); } catch (err) { console.error(`[redis] ${err}`); }
@@ -1312,6 +1318,61 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
   }
 }
 
+// ---------------------------------------------------------------- job_freshness -> Layerbase (best effort)
+// job_freshness lives in a second database now. Writes here are queued in memory and flushed in
+// bulk every 30s; a failure leaves the rows queued and never blocks, defers or requeues a job.
+const freshDb = FRESHNESS_DB_URL
+  ? new pg.Pool({
+    connectionString: FRESHNESS_DB_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 2,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
+  })
+  : null;
+if (freshDb) freshDb.on("error", (e: Error) => console.error(`[fresh] db ${e.message}`));
+else console.warn("[fresh] FRESHNESS_DB_URL is not set: freshness rows will NOT be written");
+
+type FreshRow = {
+  job_id: string;
+  job_url: string;
+  dedup_hash: string | null;
+  source: string | null;
+  expires_at: string;
+};
+const freshQueue = new Map<string, FreshRow>();
+
+function queueFresh(row: FreshRow): void {
+  if (!freshDb) return;
+  if (freshQueue.size >= 5000) {
+    const oldest = freshQueue.keys().next().value;
+    if (oldest) { freshQueue.delete(oldest); state.fresh_failed++; }
+  }
+  freshQueue.set(row.job_id, row); // one entry per job, last write wins
+  if (freshQueue.size >= 100) void flushFresh(); // a restart loses the queue, so don't let it grow
+}
+
+async function flushFresh(): Promise<void> {
+  if (!freshDb || freshQueue.size === 0) return;
+  const batch = [...freshQueue.values()].slice(0, 200);
+  const values = batch.map((_, i) => `($${i * 5 + 1},$${i * 5 + 2},$${i * 5 + 3},$${i * 5 + 4},$${i * 5 + 5})`).join(",");
+  const params = batch.flatMap((r) => [r.job_id, r.job_url, r.dedup_hash, r.source, r.expires_at]);
+  try {
+    // is_active is deliberately absent from the update: a job already marked dead stays dead.
+    await freshDb.query(
+      `insert into ${FRESHNESS_TABLE} (job_id, job_url, dedup_hash, source, expires_at) values ${values}
+       on conflict (job_id) do update set
+         job_url = excluded.job_url, dedup_hash = excluded.dedup_hash,
+         source = excluded.source, expires_at = excluded.expires_at`,
+      params,
+    );
+    for (const r of batch) freshQueue.delete(r.job_id);
+    state.fresh_written += batch.length;
+  } catch (e) {
+    console.error(`[fresh] ${batch.length} row(s) not written, kept for the next flush: ${String(e).slice(0, 200)}`);
+  }
+}
+
 // ---------------------------------------------------------------- freshness (was Inngest cron)
 async function callFreshness(body: Record<string, unknown>): Promise<any> {
   if (!FRESHNESS_SECRET) throw new Error("FRESHNESS_SECRET is not set");
@@ -1369,6 +1430,7 @@ async function freshnessRun() {
 }
 
 async function freshnessProof() {
+  if (freshDb) return await freshnessProofLayerbase(); // rows live there now
   try {
     const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
     const since14 = new Date(Date.now() - 14 * 24 * 3600 * 1000).toISOString();
@@ -1405,6 +1467,45 @@ async function freshnessProof() {
   }
 }
 
+// The heartbeat is sweep_state.updated_at, which the sweeper touches on every batch.
+// last_checked_at is no longer evidence of anything: open rows are deliberately not written to,
+// so a "checked in the last 24h" count would read zero forever and cry wolf.
+async function freshnessProofLayerbase() {
+  try {
+    const { rows } = await freshDb!.query(
+      `select
+         count(*) filter (where is_active)::int as active,
+         count(*) filter (where not is_active and cf_notified_at is null and dead_at is not null)::int as dead_unsent,
+         count(*) filter (where not is_active and cf_notified_at is null and dead_at is null)::int as expired_unsent
+       from ${FRESHNESS_TABLE}`,
+    );
+    const s = rows[0] ?? { active: 0, dead_unsent: 0, expired_unsent: 0 };
+    const hb = await freshDb!.query(`select sweeps_done, checked_total, updated_at from sweep_state where id = 1`);
+    const st = hb.rows[0];
+    const ageS = st ? Math.round((Date.now() - new Date(st.updated_at).getTime()) / 1000) : null;
+    const problems: string[] = [];
+    if (!st) problems.push("sweep_state row 1 is missing: the sweeper cannot save its cursor");
+    else if (ageS !== null && ageS > 300) problems.push(`sweeper heartbeat is ${ageS}s old: the Render sweeper is not sweeping`);
+    if (Number(s.dead_unsent) > 50) problems.push(`${s.dead_unsent} dead jobs never reached Cloudflare`);
+    if (Number(s.expired_unsent) > 50) problems.push(`${s.expired_unsent} expired jobs never reached Cloudflare`);
+    if (problems.length) console.error(`[freshness-proof] PROBLEMS: ${problems.join(" | ")}`);
+    else {
+      console.log("[freshness-proof] ok", JSON.stringify({
+        active: s.active,
+        dead_unsent: s.dead_unsent,
+        expired_unsent: s.expired_unsent,
+        sweeps_done: st?.sweeps_done,
+        checked_total: st?.checked_total,
+        heartbeat_age_s: ageS,
+        fresh_written: state.fresh_written,
+        fresh_queued: freshQueue.size,
+      }));
+    }
+  } catch (e) {
+    console.error(`[freshness-proof] ${String(e).slice(0, 300)}`);
+  }
+}
+
 // ---------------------------------------------------------------- start everything
 await recoverStuck();
 
@@ -1425,8 +1526,16 @@ for (const k of KEYS) {
   }
 }
 
-setInterval(freshnessRun, FRESHNESS_EVERY_MS);
-freshnessRun();
+// The Render sweeper (freshness-sweeper) walks Layerbase continuously. This old driver only
+// exists as a kill switch: FRESHNESS_DRIVER=on brings the Supabase path back.
+if (FRESHNESS_DRIVER) {
+  console.warn("[freshness] old Supabase driver is ON (FRESHNESS_DRIVER=on): two sweepers may overlap");
+  setInterval(freshnessRun, FRESHNESS_EVERY_MS);
+  freshnessRun();
+} else {
+  console.log("[freshness] old Supabase driver is OFF: the Render sweeper checks Layerbase now");
+}
+setInterval(flushFresh, 30_000);
 
 let lastProofDay = "";
 setInterval(() => {
@@ -1441,7 +1550,7 @@ setInterval(() => {
 // heartbeat so you always see it alive in the Render logs
 setInterval(async () => {
   const pending = await pendingCount();
-  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} no_location=${state.jobs_dropped} unresolved=${state.jobs_unresolved} stale=${state.jobs_stale} stale_pre=${state.stale_precheck} loc[asked=${state.loc_reasoned} resolved=${state.loc_resolved} none=${state.loc_none} unusable=${state.loc_unusable} unavailable=${state.loc_unavailable} cap=${state.loc_skipped_cap} circuit=${state.loc_circuit}] lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
+  console.log(`[status] pending=${pending} inflight=${state.inflight}/${state.lanes_total} ok=${state.batches_ok} failed=${state.batches_failed} written=${state.jobs_written} no_location=${state.jobs_dropped} unresolved=${state.jobs_unresolved} stale=${state.jobs_stale} stale_pre=${state.stale_precheck} loc[asked=${state.loc_reasoned} resolved=${state.loc_resolved} none=${state.loc_none} unusable=${state.loc_unusable} unavailable=${state.loc_unavailable} cap=${state.loc_skipped_cap} circuit=${state.loc_circuit}] fresh=${state.fresh_written}w/${freshQueue.size}q/${state.fresh_failed}dropped lastGemini=${(state.last_gemini_ms / 1000).toFixed(1)}s`);
 }, 30_000);
 
 console.log(`[init] worker up: ${state.lanes_total} lanes`);
