@@ -57,7 +57,15 @@ const CF_WORKER_URL = Deno.env.get("CF_WORKER_URL") || "";
 const FRESHNESS_EVERY_MS = 10 * 60 * 1000;
 const FRESHNESS_BATCHES = 3;
 const FRESHNESS_LIMIT = 200;
-const FRESHNESS_DB_URL = Deno.env.get("FRESHNESS_DB_URL") || ""; // Layerbase: where job_freshness lives now
+const FRESHNESS_DB_URL = Deno.env.get("FRESHNESS_DB_URL") || ""; // Aiven Postgres: where job_freshness lives now
+const FRESHNESS_DB_CA = Deno.env.get("FRESHNESS_DB_CA") || "";   // contents of Aiven's project ca.pem
+
+// Aiven signs with a per-project self-signed CA and pg >= 8.16 treats sslmode=require as
+// verify-full, so an sslmode in the URL overrides the ssl option below and the connection
+// dies with "self-signed certificate in certificate chain". Strip it, decide TLS here.
+function stripSslMode(raw: string): string {
+  try { const u = new URL(raw); u.searchParams.delete("sslmode"); return u.toString(); } catch { return raw; }
+}
 const FRESHNESS_DRIVER = (Deno.env.get("FRESHNESS_DRIVER") ?? "off").toLowerCase() === "on"; // old driver into the Supabase function
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -191,9 +199,15 @@ interface Normalized {
   seniority: string; // intern | junior | mid | senior | lead | unknown
 }
 
-function stripHtmlArtifacts(text: string): string {
-  if (!text) return text;
-  return text
+function stripHtmlArtifacts(text: unknown): string {
+  // The model sometimes returns an array or object where the schema says string.
+  // `raw.field ?? ""` does not catch that, so one malformed reply used to throw
+  // "text.replace is not a function" AFTER the paid call had already returned —
+  // the tokens were billed and the result thrown away.
+  if (text == null) return "";
+  const s = Array.isArray(text) ? text.filter((x) => x != null).join("\n") : String(text);
+  if (!s) return "";
+  return s
     .replace(/<[^>]*>/g, "")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
@@ -1318,13 +1332,15 @@ async function lane(keyIdx: number, laneNo: number, apiKey: string) {
   }
 }
 
-// ---------------------------------------------------------------- job_freshness -> Layerbase (best effort)
+// ---------------------------------------------------------------- job_freshness -> Aiven Postgres (best effort)
 // job_freshness lives in a second database now. Writes here are queued in memory and flushed in
 // bulk every 30s; a failure leaves the rows queued and never blocks, defers or requeues a job.
 const freshDb = FRESHNESS_DB_URL
   ? new pg.Pool({
-    connectionString: FRESHNESS_DB_URL,
-    ssl: { rejectUnauthorized: false },
+    connectionString: stripSslMode(FRESHNESS_DB_URL),
+    // Pinned project CA when FRESHNESS_DB_CA is set, otherwise standard verification —
+    // which Aiven's self-signed chain rejects on purpose rather than trusting blindly.
+    ssl: FRESHNESS_DB_CA ? { ca: FRESHNESS_DB_CA, rejectUnauthorized: true } : { rejectUnauthorized: true },
     max: 2,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
@@ -1430,7 +1446,7 @@ async function freshnessRun() {
 }
 
 async function freshnessProof() {
-  if (freshDb) return await freshnessProofLayerbase(); // rows live there now
+  if (freshDb) return await freshnessProofPg(); // rows live there now
   try {
     const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
     const since14 = new Date(Date.now() - 14 * 24 * 3600 * 1000).toISOString();
@@ -1470,7 +1486,7 @@ async function freshnessProof() {
 // The heartbeat is sweep_state.updated_at, which the sweeper touches on every batch.
 // last_checked_at is no longer evidence of anything: open rows are deliberately not written to,
 // so a "checked in the last 24h" count would read zero forever and cry wolf.
-async function freshnessProofLayerbase() {
+async function freshnessProofPg() {
   try {
     const { rows } = await freshDb!.query(
       `select
@@ -1526,14 +1542,14 @@ for (const k of KEYS) {
   }
 }
 
-// The Render sweeper (freshness-sweeper) walks Layerbase continuously. This old driver only
+// The Render sweeper (freshness-sweeper) walks Aiven continuously. This old driver only
 // exists as a kill switch: FRESHNESS_DRIVER=on brings the Supabase path back.
 if (FRESHNESS_DRIVER) {
   console.warn("[freshness] old Supabase driver is ON (FRESHNESS_DRIVER=on): two sweepers may overlap");
   setInterval(freshnessRun, FRESHNESS_EVERY_MS);
   freshnessRun();
 } else {
-  console.log("[freshness] old Supabase driver is OFF: the Render sweeper checks Layerbase now");
+  console.log("[freshness] old Supabase driver is OFF: the Render sweeper checks Aiven now");
 }
 setInterval(flushFresh, 30_000);
 
