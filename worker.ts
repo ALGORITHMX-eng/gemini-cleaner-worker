@@ -755,7 +755,7 @@ class GeminiError extends Error {
   }
 }
 
-const MAX_TOKENS = Number(Deno.env.get("MAX_TOKENS") ?? (USE === "gemini" ? 65000 : USE === "openrouter" ? 32000 : 16384));
+const MAX_TOKENS = Number(Deno.env.get("MAX_TOKENS") ?? (USE === "gemini" ? 65000 : USE === "openrouter" ? 32000 : 40000));
 // thinking is OFF and temperature is 0 on every provider
 const GEMINI_REASONING = Deno.env.get("GEMINI_REASONING_EFFORT") ?? "none"; // if Gemini answers HTTP 400 to "none", set this env to "minimal" or "low"
 
