@@ -163,6 +163,7 @@ Also read the fields below from the WHOLE posting. Your answer is FINAL: it is s
 - "seniority_evidence": the exact short phrase (under 25 words, copied word-for-word) from the title or description that shows the level of the role: a title word such as "Intern", "Junior", "Senior", "Staff", "Lead", "Principal", "Head of", or a years-of-experience requirement for THIS role. null if there is none. Fill this BEFORE seniority.
 - "seniority": one of "intern", "junior", "mid", "senior", "lead", "unknown". Set it ONLY from seniority_evidence; if seniority_evidence is null this MUST be "unknown". A level word in the title wins over years of experience. intern = Intern, Internship, Trainee, Working Student. junior = Junior, Jr, Entry Level, Graduate, or 0-2 years required. mid = Mid-level, Intermediate, or 3-5 years required. senior = Senior, Sr, or 5+ years required. lead = Lead, Staff, Principal, Head of, Director, Manager, Architect. Do not infer from salary, company size or the tech stack.
 Copy each job's "id" exactly. Do not skip a job. Do not add jobs.
+Output exactly ONE JSON object and then STOP. Your answer ends at the final closing brace: do not restart it, do not summarise it, do not review or double-check your work in the reply, and never emit a second "results" array. Everything you write after that brace is discarded.
 Respond with ONLY this JSON shape, no markdown:
 {"results":[{"id":"...","role_description":"...","requirements":"...","nice_to_have":"...","qualifications":"...","compensation":"...","benefits":"...","work_setup":"...","about_company":"...","company_culture":"...","extracted_skills":["..."],"workplace_evidence":null,"workplace_type":null,"employment_evidence":null,"employment_type":null,"seniority_evidence":null,"seniority":"unknown","location_evidence":null,"location":null,"posted_date":null}]}`;
 }
@@ -432,21 +433,56 @@ function replyText(payload: any): string {
   return String(content).replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 }
 
+// Walk from `at` (a "{") to its matching "}", ignoring braces inside strings.
+// Returns the index just past the closing brace, or -1 if it never closes (truncated).
+function objectEnd(text: string, at: number): number {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = at; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) { esc = false; continue; }
+      if (c === "\\") { esc = true; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+// The model keeps typing after its JSON: a second copy of the payload, one extra "}", or a
+// "REVIEWING YOUR WORK..." paragraph. JSON.parse(whole reply) throws on all of those.
+// salvageResults() used the NEXT id's start as the end of the current job's block, so the
+// LAST job in every batch had no boundary and swallowed the trailing junk -> 3/4 and 0/1.
+function extractFirstJson(text: string): any | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  const end = objectEnd(text, start);
+  if (end < 0) return null;
+  try { return JSON.parse(text.slice(start, end)); } catch { return null; }
+}
+
 // when the whole reply is not valid JSON, rescue every job whose own block still parses
 function salvageResults(text: string, ids: string[]): SectionResult[] {
-  const starts: { at: number }[] = [];
+  const starts: number[] = [];
   for (const id of ids) {
     const esc = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const m = new RegExp(`\\{\\s*"id"\\s*:\\s*"${esc}"`).exec(text);
-    if (m) starts.push({ at: m.index });
+    if (m) starts.push(m.index);
   }
-  starts.sort((a, b) => a.at - b.at);
+  starts.sort((a, b) => a - b);
   const out: SectionResult[] = [];
-  for (let i = 0; i < starts.length; i++) {
-    const seg = text.slice(starts[i].at, i + 1 < starts.length ? starts[i + 1].at : text.length).replace(/[\s,]+$/, "");
-    for (const candidate of [seg, seg.replace(/\]\s*\}\s*$/, "").replace(/[\s,]+$/, "")]) {
-      try { out.push(JSON.parse(candidate)); break; } catch { /* try the next form */ }
-    }
+  for (const at of starts) {
+    const end = objectEnd(text, at); // true end of THIS object, not the next id's start
+    if (end < 0) continue;
+    try { out.push(JSON.parse(text.slice(at, end))); } catch { /* skip this job */ }
   }
   return out;
 }
@@ -454,7 +490,9 @@ function salvageResults(text: string, ids: string[]): SectionResult[] {
 function parseResults(payload: any): SectionResult[] {
   const content = payload?.choices?.[0]?.message?.content ?? "";
   const text = String(content).replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-  const parsed = JSON.parse(text);
+  // take the first complete object and ignore anything the model appended after it
+  const parsed = extractFirstJson(text);
+  if (parsed === null) JSON.parse(text); // genuinely truncated -> throw so the caller salvages
   if (Array.isArray(parsed)) return parsed;
   if (Array.isArray(parsed?.results)) return parsed.results;
   if (parsed?.id) return [parsed];
