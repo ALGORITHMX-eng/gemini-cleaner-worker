@@ -46,6 +46,16 @@ const MAX_CHARS = 17000; // content characters sent per job (the label lines are
 const MAX_BATCH_CHARS = Number(Deno.env.get("MAX_BATCH_CHARS") ?? 200_000); // a call never carries more content than this; extra jobs go back to pending
 const EXPIRES_DAYS = 90;
 const MAX_AGE_DAYS = Number(Deno.env.get("MAX_AGE_DAYS") ?? 30); // a posting the model dates older than this is dropped as stale. 0 = keep everything
+/**
+ * The gate that runs before a model call, on the posting's own words only
+ * ("Posted 12 November", "3 weeks ago"). A week is enough there: the date is
+ * read off the page, and a stale one costs a full extraction if it gets through.
+ *
+ * Deliberately independent of MAX_AGE_DAYS. That one acts on a date the model
+ * inferred, so it stays the more forgiving of the two — a wrong inference must
+ * not throw away a live posting.
+ */
+const PRECHECK_AGE_DAYS = Number(Deno.env.get("PRECHECK_AGE_DAYS") ?? 7); // 0 = keep everything
 const STORE_RAW_TEXT = false;
 const GLOBAL_LABEL = "Worldwide"; // the word the model is told to use when a posting is open to anywhere
 const FRESHNESS_TABLE = "job_freshness";
@@ -83,7 +93,7 @@ function loadKeys(): { idx: number; key: string }[] {
   // also accept a single plain NVIDIA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY
   const plain = (Deno.env.get(KEY_PREFIX) ?? "").trim();
   if (plain && !seen.has(plain)) out.unshift({ idx: 1, key: plain });
-  console.log(`[init] provider=${USE} model=${MODEL || "(NOT SET)"} url=${GEMINI_URL} keys=${out.length} lanes_per_key=${LANES_PER_KEY} batch=${BATCH} timeout=${GEMINI_TIMEOUT_MS / 1000}s max_age_days=${MAX_AGE_DAYS}`);
+  console.log(`[init] provider=${USE} model=${MODEL || "(NOT SET)"} url=${GEMINI_URL} keys=${out.length} lanes_per_key=${LANES_PER_KEY} batch=${BATCH} timeout=${GEMINI_TIMEOUT_MS / 1000}s max_age_days=${MAX_AGE_DAYS} precheck_age_days=${PRECHECK_AGE_DAYS}`);
   return out;
 }
 const KEYS = loadKeys();
@@ -1111,12 +1121,12 @@ function readPostedDate(content: string): number | null {
  * every job goes through as before.
  */
 async function dropStaleEarly(tag: string, jobs: any[]): Promise<any[]> {
-  if (!jobs.length || MAX_AGE_DAYS <= 0) return jobs;
+  if (!jobs.length || PRECHECK_AGE_DAYS <= 0) return jobs;
   const keep: any[] = [];
   const stale: string[] = [];
   for (const job of jobs) {
     const t = readPostedDate(getJobContent(job));
-    if (t != null && (Date.now() - t) / DAY_MS > MAX_AGE_DAYS) { stale.push(job.id); continue; }
+    if (t != null && (Date.now() - t) / DAY_MS > PRECHECK_AGE_DAYS) { stale.push(job.id); continue; }
     keep.push(job);
   }
   if (!stale.length) return jobs;
